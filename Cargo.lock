@@ -1728,6 +1728,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+
+[[package]]
 name = "bstr"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3600,6 +3606,7 @@ checksum = "7277392b266383ef8396db7fdeb1e77b6c52fed775f5df15bb24f35b72156980"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core",
  "serde",
  "sha2",
  "signature 2.0.0",
@@ -3779,6 +3786,11 @@ dependencies = [
  "quote",
  "syn 2.0.48",
 ]
+
+[[package]]
+name = "enum-variants"
+version = "0.170.0"
+source = "git+https://github.com/kamu-data/kamu-cli?tag=v0.170.0#5fb3fb4d2d721ca091e518e5186b2213c487d254"
 
 [[package]]
 name = "enumflags2"
@@ -5322,6 +5334,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
+name = "internal-error"
+version = "0.170.0"
+source = "git+https://github.com/kamu-data/kamu-cli?tag=v0.170.0#5fb3fb4d2d721ca091e518e5186b2213c487d254"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "io-extras"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5549,6 +5569,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecc2af9a1119c51f12a14607e783cb977bde58bc069ff0c3da1095e635d70654"
+dependencies = [
+ "cpufeatures",
+]
+
+[[package]]
 name = "keyed_priority_queue"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5762,6 +5791,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "like"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc7281e4b2b1a1fae03463a7c49dd21464de50251a450f6da9715c40c7b21a70"
 
 [[package]]
 name = "link-cplusplus"
@@ -6270,6 +6305,22 @@ name = "more-asserts"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fafa6961cabd9c63bcd77a45d7e3b7f3b552b70417831fb0f56db717e72407e"
+
+[[package]]
+name = "multiformats"
+version = "0.170.0"
+source = "git+https://github.com/kamu-data/kamu-cli?tag=v0.170.0#5fb3fb4d2d721ca091e518e5186b2213c487d254"
+dependencies = [
+ "bs58",
+ "digest",
+ "ed25519-dalek",
+ "hex",
+ "rand",
+ "serde",
+ "sha3",
+ "thiserror",
+ "unsigned-varint",
+]
 
 [[package]]
 name = "multimap"
@@ -6793,6 +6844,33 @@ dependencies = [
  "sha2",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "opendatafabric"
+version = "0.170.0"
+source = "git+https://github.com/kamu-data/kamu-cli?tag=v0.170.0#5fb3fb4d2d721ca091e518e5186b2213c487d254"
+dependencies = [
+ "base64 0.21.7",
+ "chrono",
+ "digest",
+ "ed25519-dalek",
+ "enum-variants",
+ "flatbuffers",
+ "futures-core",
+ "hex",
+ "internal-error",
+ "like",
+ "multiformats",
+ "prost 0.12.1",
+ "rand",
+ "serde",
+ "serde_with",
+ "serde_yaml",
+ "sha3",
+ "thiserror",
+ "tonic 0.10.2",
+ "url",
 ]
 
 [[package]]
@@ -9284,6 +9362,7 @@ dependencies = [
  "nexmark",
  "num-bigint",
  "opendal",
+ "opendatafabric",
  "openssl",
  "parking_lot 0.12.1",
  "paste",
@@ -11371,6 +11450,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha3"
+version = "0.10.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
+dependencies = [
+ "digest",
+ "keccak",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13136,6 +13225,12 @@ name = "unsafe-libyaml"
 version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab4c90930b95a82d00dc9e9ac071b4991924390d46cbd0dfe566148667605e4b"
+
+[[package]]
+name = "unsigned-varint"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
 
 [[package]]
 name = "untrusted"

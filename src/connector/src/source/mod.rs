@@ -24,6 +24,7 @@ pub mod monitor;
 pub mod mqtt;
 pub mod nats;
 pub mod nexmark;
+pub mod odf;
 pub mod pulsar;
 pub use base::{UPSTREAM_SOURCE_KEY, *};
 pub(crate) use common::*;
@@ -45,6 +46,7 @@ pub use crate::source::filesystem::opendal_source::{
 };
 pub use crate::source::filesystem::S3_CONNECTOR;
 pub use crate::source::nexmark::NEXMARK_CONNECTOR;
+pub use crate::source::odf::ODF_CONNECTOR;
 pub use crate::source::pulsar::PULSAR_CONNECTOR;
 
 pub fn should_copy_to_format_encode_options(key: &str, connector: &str) -> bool {

@@ -1222,7 +1222,9 @@ pub mod default {
         }
 
         pub fn telemetry_enabled() -> bool {
-            true
+            // Apoligies RW team, but ODF engines run in restricted
+            // container sandboxes where networking is not available
+            false
         }
 
         pub fn grpc_max_reset_stream_size() -> u32 {
