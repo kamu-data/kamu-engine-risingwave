@@ -1,0 +1,68 @@
+[package]
+name = "kamu-engine-risingwave"
+version = "0.1.0"
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+
+
+[lib]
+doctest = false
+
+
+[features]
+embedded = ["risingwave_cmd_all", "risingwave_rt"]
+rw-static-link = ["workspace-config/rw-static-link"]
+rw-dynamic-link = ["workspace-config/rw-dynamic-link"]
+default = ["rw-static-link"]
+
+
+[package.metadata.cargo-machete]
+ignored = ["workspace-hack", "workspace-config", "task_stats_alloc"]
+
+[package.metadata.cargo-udeps.ignore]
+ignored = ["workspace-hack", "workspace-config", "task_stats_alloc"]
+
+
+[dependencies]
+internal-error = { git = "https://github.com/kamu-data/kamu-cli", tag = "v0.170.0", version = "0.170.0", default-features = false }
+opendatafabric = { git = "https://github.com/kamu-data/kamu-cli", tag = "v0.170.0", version = "0.170.0", default-features = false }
+anyhow = "1"
+indoc = "2"
+chrono = "0.4"
+datafusion = { workspace = true, default-features = false, features = ["parquet"] }
+nix = "0"
+risingwave_common = { workspace = true }
+risingwave_cmd_all = { workspace = true, optional = true }
+risingwave_rt = { workspace = true, optional = true  }
+risingwave_pb = { workspace = true }
+risingwave_rpc_client = { workspace = true }
+serde = "1"
+serde_json = "1"
+serde_with = "3"
+tar = "0.4"  # Checkpoitnt packing
+tikv-jemallocator = { workspace = true, features = [
+    "unprefixed_malloc_on_supported_platforms",
+] }
+thiserror-ext = { workspace = true }
+tokio = { version = "1", default-features = false, features=[] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+tokio-stream = "0.1"
+tonic = "0.10"
+tracing = "0.1"
+tracing-bunyan-formatter = "0.3"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+workspace-config = { path = "../utils/workspace-config" }
+workspace-hack = { path = "../workspace-hack" }
+
+
+[dev-dependencies]
+tempfile = "3"
+test-log = { version = "0.2", features = ["trace"] }
+
+
+[lints]
+workspace = true

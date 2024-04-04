@@ -198,20 +198,29 @@ impl<S: StateStore> WatermarkFilterExecutor<S> {
                 }
                 Message::Watermark(watermark) => {
                     if watermark.col_idx == event_time_col_idx {
-                        tracing::warn!("WatermarkFilterExecutor received a watermark on the event it is filtering.");
-                        let watermark = watermark.val;
-                        if let Some(cur_watermark) = current_watermark.clone()
-                            && cur_watermark.default_cmp(&watermark).is_lt()
-                        {
-                            current_watermark = Some(watermark.clone());
-                            idle_input = false;
-                            yield Message::Watermark(Watermark::new(
-                                event_time_col_idx,
-                                watermark_type.clone(),
-                                watermark,
-                            ));
-                        }
+                        // HACK: KAMU: It is not possible for sources currently to define their own
+                        // watermarks. We have a hack that attaches WMs to source chunks for source
+                        // executor to then unpack them to WM messages, but this is not enough -
+                        // other components of RW will not understand that the source defines a WM
+                        // unless it's declared.
+                        //
+                        // We therefore define our sources as:
+                        //  create source x (
+                        //    <schema>,
+                        //    watermark for <col> as timestamp with time zone '0000-01-01 00:00:00+00'
+                        // )
+                        //
+                        // We modify logic below not to obstruct the propagation of our watermarks
+
+                        current_watermark = Some(watermark.val.clone());
+                        idle_input = false;
+                        tracing::info!(?watermark, "Kamu: Propagating source watermark");
+                        yield Message::Watermark(watermark);
                     } else {
+                        tracing::info!(
+                            ?watermark,
+                            "Kamu: Propagating source watermark (column mismatch)"
+                        );
                         yield Message::Watermark(watermark)
                     }
                 }

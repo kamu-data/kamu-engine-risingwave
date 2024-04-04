@@ -33,6 +33,7 @@ members = [
   "src/meta/node",
   "src/meta/service",
   "src/object_store",
+  "src/odf_adapter",
   "src/prost",
   "src/prost/helpers",
   "src/risedevtool",
@@ -144,6 +145,8 @@ arrow-array-deltalake = { package = "arrow-array", version = "48.0.1" }
 arrow-buffer-deltalake = { package = "arrow-buffer", version = "48.0.1" }
 arrow-cast-deltalake = { package = "arrow-cast", version = "48.0.1" }
 arrow-schema-deltalake = { package = "arrow-schema", version = "48.0.1" }
+# Keep in sync with deltalake dependency
+datafusion = { version = "35", default-features = false }
 # Use a forked version which removes the dependencies on dynamo db to reduce
 # compile time and binary size.
 deltalake = { git = "https://github.com/risingwavelabs/delta-rs", rev = "5c2dccd4640490202ffe98adbd13b09cef8e007b", features = [
@@ -173,6 +176,7 @@ tracing-opentelemetry = "0.22"
 risingwave_backup = { path = "./src/storage/backup" }
 risingwave_batch = { path = "./src/batch" }
 risingwave_cmd = { path = "./src/cmd" }
+risingwave_cmd_all = { path = "./src/cmd_all" }
 risingwave_common = { path = "./src/common" }
 risingwave_common_service = { path = "./src/common/common_service" }
 risingwave_common_estimate_size = { path = "./src/common/estimate_size" }
@@ -251,10 +255,10 @@ redundant_explicit_links = "allow"
 
 [profile.dev]
 lto = 'off'
+debug = "line-tables-only"
 
 [profile.release]
-debug = "full"
-split-debuginfo = "packed"
+debug = "line-tables-only"
 lto = "thin"
 
 # The profile used for CI in main branch.

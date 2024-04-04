@@ -647,6 +647,13 @@ macro_rules! converts_generic {
                             .unwrap()
                             .try_into()?,
                     )),
+                    Timestamp(Millisecond, Some(_)) => Ok(ArrayImpl::Timestamptz(
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                            .unwrap()
+                            .try_into()?,
+                    )),
                     // This arrow decimal type is used by iceberg source to read iceberg decimal into RW decimal.
                     Decimal128(_, _) => Ok(ArrayImpl::Decimal(
                         array
@@ -703,6 +710,8 @@ impl From<&arrow_schema::DataType> for DataType {
             Time64(Microsecond) => Self::Time,
             Timestamp(Microsecond, None) => Self::Timestamp,
             Timestamp(Microsecond, Some(_)) => Self::Timestamptz,
+            Timestamp(Millisecond, None) => Self::Timestamp,
+            Timestamp(Millisecond, Some(_)) => Self::Timestamptz,
             Interval(MonthDayNano) => Self::Interval,
             Binary => Self::Bytea,
             Utf8 => Self::Varchar,
@@ -834,7 +843,17 @@ converts!(DateArray, arrow_array::Date32Array, @map);
 converts!(TimeArray, arrow_array::Time64MicrosecondArray, @map);
 converts!(TimestampArray, arrow_array::TimestampMicrosecondArray, @map);
 converts!(TimestamptzArray, arrow_array::TimestampMicrosecondArray, @map);
+// converts!(TimestamptzArray, arrow_array::TimestampMillisecondArray, @map);
 converts!(IntervalArray, arrow_array::IntervalMonthDayNanoArray, @map);
+
+impl From<&arrow_array::TimestampMillisecondArray> for TimestamptzArray {
+    fn from(array: &arrow_array::TimestampMillisecondArray) -> Self {
+        array
+            .iter()
+            .map(|o| o.map(|v| Timestamptz::from_millis(v).unwrap()))
+            .collect()
+    }
+}
 
 /// Converts RisingWave value from and into Arrow value.
 trait FromIntoArrow {

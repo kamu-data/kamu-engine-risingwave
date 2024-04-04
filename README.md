@@ -1,144 +1,88 @@
-
-<p align="center">
-  <picture>
-    <source srcset=".github/RisingWave-logo-dark.svg" width="500px" media="(prefers-color-scheme: dark)">
-    <img src=".github/RisingWave-logo-light.svg" width="500px">
-  </picture>
-</p>
-
+# Open Data Fabric: RisingWave Engine
 
 <div align="center">
 
-### 🌊 Reimagine Stream Processing.
+[![Release](https://img.shields.io/github/v/release/kamu-data/kamu-engine-risingwave?include_prereleases&logo=rust&logoColor=orange&style=for-the-badge)](https://github.com/kamu-data/kamu-engine-risingwave/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/kamu-data/kamu-engine-risingwave/build.yaml?logo=githubactions&label=CI&logoColor=white&style=for-the-badge&branch=master)](https://github.com/kamu-data/kamu-engine-risingwave/actions)
+[![Dependencies](https://deps.rs/repo/github/kamu-data/kamu-engine-risingwave/status.svg?&style=for-the-badge)](https://deps.rs/repo/github/kamu-data/kamu-engine-risingwave)
+[![Chat](https://shields.io/discord/898726370199359498?style=for-the-badge&logo=discord&label=Discord)](https://discord.gg/nU6TXRQNXC)
 
 </div>
 
-<p align="center">
-  <a
-    href="https://docs.risingwave.com/"
-    target="_blank"
-  ><b>Documentation</b></a>&nbsp;&nbsp;&nbsp;📑&nbsp;&nbsp;&nbsp;
-  <a
-    href="https://tutorials.risingwave.com/"
-    target="_blank"
-  ><b>Hands-on Tutorials</b></a>&nbsp;&nbsp;&nbsp;🎯&nbsp;&nbsp;&nbsp;
-  <a
-    href="https://cloud.risingwave.com/"
-    target="_blank"
-  ><b>RisingWave Cloud</b></a>&nbsp;&nbsp;&nbsp;🚀&nbsp;&nbsp;&nbsp;
-  <a
-    href="https://risingwave.com/slack"
-    target="_blank"
-  >
-    <b>Get Instant Help</b>
-  </a>
-</p>
-<div align="center">
-  <a
-    href="https://risingwave.com/slack"
-    target="_blank"
-  >
-    <img alt="Slack" src="https://badgen.net/badge/Slack/Join%20RisingWave/0abd59?icon=slack" />
-  </a>
-  <a
-    href="https://twitter.com/risingwavelabs"
-    target="_blank"
-  >
-    <img alt="X" src="https://img.shields.io/twitter/follow/risingwavelabs" />
-  </a>
-  <a
-    href="https://www.youtube.com/@risingwave-labs"
-    target="_blank"
-  >
-    <img alt="YouTube" src="https://img.shields.io/youtube/channel/views/UCsHwdyBRxBpmkA5RRd0YNEA" />
-  </a>
-</div>
+This the implementation of the `Engine` contract of [Open Data Fabric](http://opendatafabric.org/) using the [RisingWave](https://github.com/risingwavelabs/risingwave) open-source streaming database. It is currently in use in [kamu](https://github.com/kamu-data/kamu-cli) data management tool.
 
-RisingWave is a Postgres-compatible streaming database engineered to provide the <i><b>simplest</b></i> and <i><b>most cost-efficient</b></i> approach for <b>processing</b>, <b>analyzing</b>, and <b>managing</b> real-time event streaming data.
+This repository is a fork of the [RisingWave repo](https://github.com/risingwavelabs/risingwave) since it currently cannot be used as a library or extended in a modular way with ODF-specific sources and sinks.
 
 
-![RisingWave](https://github.com/risingwavelabs/risingwave-docs/blob/main/docs/images/new_archi_grey.png)
+## Features
+This engine is experimental and has limited functionality.
 
-## Try it out in 60 seconds
+We currently recommend it for queries like:
+- Streaming aggregations using window functions
+- Streaming aggregations using tumbling windows with `GROUP BY`
+- Top-N aggregations via materialized views
 
-Install RisingWave:
-```shell
-curl https://risingwave.com/sh | sh
+More information and engine comparisons are [available here](https://docs.kamu.dev/cli/supported-engines/).
+
+
+## Use
+See RisingWave [examples](https://docs.risingwave.com/docs/current/get-started/), and [SQL reference](https://docs.risingwave.com/docs/current/sql-references/) for inspiration.
+
+Have a look at [integration tests](./src/odf_adapter/tests/tests/) in this repo for examples of different transform categories.
+
+Pay special attention to [`EMIT ON WINDOW CLOSE`](https://docs.risingwave.com/docs/current/emit-on-window-close/) as unlike Flink, RisingWave does not operate in event-time processing mode by default. In future we may hide this under the hood, but currently you need to specify this clause in your queries explicitly.
+
+
+## Limitations
+1) No support for event-time `JOIN`s. Only processing-time joins are supported. There might be some workarounds depending on the use case.
+  
+See: https://docs.risingwave.com/docs/current/query-syntax-join-clause/#process-time-temporal-joins
+
+2) No support for allowed **lateness intervals**. Unlike Flink where lateness and watermark are separate concepts, RisingWave will drop all events below the current watermark.
+
+See: https://docs.risingwave.com/docs/current/watermarks/
+
+3) A `SOURCE` accepts append-only data. A `TABLE` with connector accepts both append-only data and updatable data, but it persists all data that flows in meaning that ODF checkpoints would grow significantly.
+
+See: https://docs.risingwave.com/docs/current/data-ingestion/
+
+4) Requires row IDs assignment for delete/update operations.
+
+Currently ODF does not preserve a link between a retraction and the row being retracted. This is easy to implement for ingest merge strategies via additional column, but we would need to assess if this is a reasonable demand for all transform engines that emit retractions/corrections.
+
+An alternative would be to specify primary key for RW source and ensure it uses that to associate delete with the record being deleted.
+
+
+## Developing
+This repository is a fork of the RisingWave engine. Please refer to the [upstream repo](https://github.com/risingwavelabs/risingwave) for developer documentation.
+
+To help with really bad build time we add this to `Cargo.toml`:
+```toml
+[profile.dev]
+debug = "line-tables-only"
 ```
 
-Then follow the prompts to start and connect to RisingWave.
+To build the engine run:
+```sh
+# Use CARGO_BUILD_JOBS=N env var if this drains your RAM
+./risedev b
+```
 
-To learn about other installation options such as Docker, see [Quick Start](https://docs.risingwave.com/docs/current/get-started/).
+Run the tests (note that tests use fixed ports and thus must run one at a time):
+```sh
+cd odf
+make test
+```
 
-## Production deployments
+Key directories:
+- `odf` - build scripts, container image, and other stuff
+- `src/odf_adapter` - gRPC server that communicates with ODF coordinator and spawns RW and a subprocess
+- `src/connectors/src/source/odf` - custom ODF source implementation
+- `src/connectors/src/sink/odf` - custom ODF sink implementation
 
-For **single-node deployment**, please refer to [Docker Compose](https://docs.risingwave.com/docs/current/risingwave-docker-compose/).
-
-For **distributed deployment**, please refer to [Kubernetes with Helm](https://docs.risingwave.com/docs/current/risingwave-k8s-helm/) or [Kubernetes with Operator](https://docs.risingwave.com/docs/current/risingwave-kubernetes/).
-
-**RisingWave Cloud** the easiest way to run a fully-fledged RisingWave cluster. Try it out for free at: [cloud.risingwave.com](https://cloud.risingwave.com).
-
-
-## Why RisingWave for stream processing?
-
-RisingWave provides users with a comprehensive set of frequently used stream processing features, including exactly-once consistency, [time window functions](https://docs.risingwave.com/docs/current/sql-function-time-window/), [watermarks](https://docs.risingwave.com/docs/current/watermarks/), and more. It specializes in providing **incrementally updated, consistent materialized views** — a persistent data structure that represents the results of stream processing. RisingWave significantly reduces the complexity of building stream processing applications by allowing developers to express intricate stream processing logic through cascaded materialized views. Furthermore, it allows users to persist data directly within the system, eliminating the need to deliver results to external databases for storage and query serving.
-
-![Real-time Data Pipelines without or with RisingWave](https://github.com/risingwavelabs/risingwave/assets/100685635/414afbb7-5187-410f-9ba4-9a640c8c6306)
-
-Compared to existing stream processing systems like [Apache Flink](https://flink.apache.org/), [Apache Spark Streaming](https://spark.apache.org/docs/latest/streaming-programming-guide.html), and [ksqlDB](https://ksqldb.io/), RisingWave stands out in two primary dimensions: **Ease-of-use** and **cost efficiency**, thanks to its **[PostgreSQL](https://www.postgresql.org/)-style interaction experience** and  **[Snowflake](https://snowflake.com/)-like architectural design** (i.e., decoupled storage and compute).
-
-### Ease-of-use
-
-* **Simple to learn**
-  * RisingWave speaks PostgreSQL-style SQL, enabling users to dive into stream processing in much the same way as operating a PostgreSQL database.
-* **Simple to develop**
-  * RisingWave operates as a relational database, allowing users to decompose stream processing logic into smaller, manageable, stacked materialized views, rather than dealing with extensive computational programs.
-* **Simple to integrate**
-  * With integrations to a diverse range of cloud systems and the PostgreSQL ecosystem, RisingWave boasts a rich and expansive ecosystem, making it straightforward to incorporate into existing infrastructures.
-
-### Cost efficiency
-
-* **Highly efficient in complex queries**
-  * RisingWave persists internal states in remote storage systems such as S3, and users can confidently and efficiently perform complex streaming queries (for example, joining dozens of data streams) in a production environment, without worrying about state size.
-* **Transparent dynamic scaling**
-  * RisingWave's state management mechanism enables near-instantaneous dynamic scaling without any service interruptions.
-* **Instant failure recovery**
-  * RisingWave's state management mechanism also allows it to recover from failure in seconds, not minutes or hours.
-
-### RisingWave as a database
-RisingWave is fundamentally a database that **extends beyond basic streaming data processing capabilities**.  It excels in **the effective management of streaming data**, making it a trusted choice for data persistence and powering online applications. RisingWave offers an extensive range of database capabilities, which include:
-
-* High availability
-* Serving highly concurrent queries
-* Role-based access control (RBAC)
-* Integration with data modeling tools, such as [dbt](https://docs.risingwave.com/docs/current/use-dbt/)
-* Integration with database management tools, such as [Dbeaver](https://docs.risingwave.com/docs/current/dbeaver-integration/)
-* Integration with BI tools, such as [Grafana](https://docs.risingwave.com/docs/current/grafana-integration/)
-* Schema change
-* Processing of semi-structured data
-
-## In-production use cases
-Within your data stack, RisingWave can assist with:
-
-* Processing and transforming event streaming data in real time
-* Offloading event-driven queries (e.g., materialized views, triggers) from operational databases
-* Performing real-time ETL (Extract, Transform, Load)
-* Supporting real-time feature stores
-
-RisingWave is extensively utilized in real-time applications such as monitoring, alerting, dashboard reporting, machine learning, among others. It has already been adopted in fields such as financial trading, manufacturing, new media, logistics, gaming, and more. Check out [customer stories](https://www.risingwave.com/use-cases/).
-
-## Community
-
-Looking for help, discussions, collaboration opportunities, or a casual afternoon chat with our fellow engineers and community members? Join our [Slack workspace](https://risingwave.com/slack)!
-
-## Notes on telemetry
-
-RisingWave collects anonymous usage statistics to better understand how the community is using RisingWave. The sole intention of this exercise is to help improve the product. Users may opt out easily at any time. Please refer to the [user documentation](https://docs.risingwave.com/docs/current/telemetry/) for more details.
-
-## License
-
-RisingWave is distributed under the Apache License (Version 2.0). Please refer to [LICENSE](LICENSE) for more information.
-
-## Contributing
-
-Thanks for your interest in contributing to the project! Please refer to [contribution guidelines](CONTRIBUTING.md) for more information.
+Environment variables:
+- `RUST_LOG=debug` - standard Rust logging
+- `RW_ODF_SOURCE_DEBUG=1` - enables debug data logging in the sink
+- `RW_ODF_SINK_DEBUG=1` - enables debug data logging in the sink
+- `RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK=10` - makes source split arrow record batches into smaller chunks
+- `RW_ODF_SOURCE_SLEEP_CHUNK_MS=500` - makes source sleep some time before yielding a chunk

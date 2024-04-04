@@ -1,0 +1,7 @@
+[system]
+barrier_interval_ms = 99999999 # ODF Adapter triggers barriers manually
+
+[meta]
+default_parallelism = 1
+disable_automatic_parallelism_control = true
+enable_compaction_deterministic = true

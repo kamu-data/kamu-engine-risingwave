@@ -549,9 +549,20 @@ impl<S: StateStore> SourceExecutor<S> {
                                 .collect::<Vec<&str>>(),
                         )
                         .inc_by(chunk.cardinality() as u64);
-                    let chunk =
+                    let mut chunk =
                         prune_additional_cols(&chunk, split_idx, offset_idx, &source_desc.columns);
-                    yield Message::Chunk(chunk);
+
+                    // HACK: KAMU: Explicit source watermark propagation
+                    if let Some((col_idx, ts)) = chunk.take_watermark() {
+                        assert_eq!(chunk.cardinality(), 0);
+                        yield Message::Watermark(Watermark {
+                            col_idx,
+                            data_type: DataType::Timestamptz,
+                            val: ScalarImpl::Timestamptz(ts),
+                        });
+                    } else {
+                        yield Message::Chunk(chunk);
+                    }
                     self.try_flush_data().await?;
                 }
             }

@@ -26,7 +26,7 @@ use risingwave_common_estimate_size::EstimateSize;
 use risingwave_pb::data::{PbOp, PbStreamChunk};
 
 use super::stream_chunk_builder::StreamChunkBuilder;
-use super::{ArrayImpl, ArrayRef, ArrayResult, DataChunkTestExt, RowRef};
+use super::{ArrayImpl, ArrayRef, ArrayResult, DataChunkTestExt, RowRef, Timestamptz};
 use crate::array::DataChunk;
 use crate::buffer::{Bitmap, BitmapBuilder};
 use crate::catalog::Schema;
@@ -89,6 +89,12 @@ pub struct StreamChunk {
     // TODO: Optimize using bitmap
     ops: Arc<[Op]>,
     data: DataChunk,
+
+    // HACK: KAMU: SplitReader can only emit StreamChunks, but out source needs to be able to also
+    // emit watermarks. The correct change would be to make split readers return some kind of a
+    // `SourceMessage` that can be a chunk or a WM, but that would be a very invasive change.
+    // Instead we are attaching watermarks to the chunk itself.
+    watermark: Option<(usize, Timestamptz)>,
 }
 
 impl Default for StreamChunk {
@@ -99,11 +105,30 @@ impl Default for StreamChunk {
         Self {
             ops: Arc::new([]),
             data: DataChunk::new(vec![], 0),
+            watermark: None,
         }
     }
 }
 
 impl StreamChunk {
+    // HACK: KAMU
+    pub fn new_watermark(col_idx: usize, ts: Timestamptz) -> Self {
+        Self {
+            ops: [].into(),
+            data: DataChunk::new(Vec::new(), Bitmap::ones(0)),
+            watermark: Some((col_idx, ts)),
+        }
+    }
+
+    // HACK: KAMU
+    pub fn with_watermark(self, watermark: Option<(usize, Timestamptz)>) -> Self {
+        Self { watermark, ..self }
+    }
+
+    pub fn take_watermark(&mut self) -> Option<(usize, Timestamptz)> {
+        self.watermark.take()
+    }
+
     /// Create a new `StreamChunk` with given ops and columns.
     pub fn new(ops: impl Into<Arc<[Op]>>, columns: Vec<ArrayRef>) -> Self {
         let ops = ops.into();
@@ -122,7 +147,11 @@ impl StreamChunk {
             assert_eq!(col.len(), ops.len());
         }
         let data = DataChunk::new(columns, visibility);
-        StreamChunk { ops, data }
+        StreamChunk {
+            ops,
+            data,
+            watermark: None,
+        }
     }
 
     /// Build a `StreamChunk` from rows.
@@ -300,6 +329,7 @@ impl StreamChunk {
         Self {
             ops: self.ops.clone(),
             data: self.data.project(indices),
+            watermark: self.watermark.clone(),
         }
     }
 
@@ -335,6 +365,7 @@ impl StreamChunk {
         Self {
             ops: self.ops.clone(),
             data: self.data.project_with_vis(indices, vis),
+            watermark: self.watermark.clone(),
         }
     }
 
@@ -343,6 +374,7 @@ impl StreamChunk {
         Self {
             ops: self.ops.clone(),
             data: self.data.with_visibility(vis),
+            watermark: self.watermark.clone(),
         }
     }
 }
@@ -614,6 +646,7 @@ impl StreamChunk {
                 return StreamChunk {
                     ops: Arc::new([]),
                     data: DataChunk::from_pretty(s),
+                    watermark: None,
                 };
             }
         };
@@ -641,6 +674,7 @@ impl StreamChunk {
         StreamChunk {
             ops: ops.into(),
             data: DataChunk::from_pretty(&chunk_str),
+            watermark: None,
         }
     }
 
@@ -689,6 +723,7 @@ impl StreamChunk {
         StreamChunk {
             ops: idx.iter().map(|&i| self.ops[i]).collect(),
             data: self.data.reorder_rows(&idx),
+            watermark: self.watermark,
         }
     }
 

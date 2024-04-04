@@ -1024,7 +1024,7 @@ static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, V
                     Format::None => vec![Encode::None],
                 ),
                 ODF_CONNECTOR => hashmap!(
-                    //Format::Native => vec![Encode::Native],
+                    Format::Native => vec![Encode::Native],
                     Format::Plain => vec![Encode::Csv],
                 )
         ))

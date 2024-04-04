@@ -31,26 +31,26 @@ use crate::ParsedStandaloneOpts;
 pub struct SingleNodeOpts {
     /// The address prometheus polls metrics from.
     #[clap(long, env = "RW_SINGLE_NODE_PROMETHEUS_LISTENER_ADDR")]
-    prometheus_listener_addr: Option<String>,
+    pub prometheus_listener_addr: Option<String>,
 
     /// The path to the cluster configuration file.
     #[clap(long, env = "RW_SINGLE_NODE_CONFIG_PATH")]
-    config_path: Option<String>,
+    pub config_path: Option<String>,
 
     /// The store directory used by meta store and object store.
     #[clap(long, env = "RW_SINGLE_NODE_STORE_DIRECTORY")]
-    store_directory: Option<String>,
+    pub store_directory: Option<String>,
 
     /// Start RisingWave in-memory.
     #[clap(long, env = "RW_SINGLE_NODE_IN_MEMORY")]
-    in_memory: bool,
+    pub in_memory: bool,
 
     /// Exit RisingWave after specified seconds of inactivity.
     #[clap(long, hide = true, env = "RW_SINGLE_NODE_MAX_IDLE_SECS")]
-    max_idle_secs: Option<u64>,
+    pub max_idle_secs: Option<u64>,
 
     #[clap(flatten)]
-    node_opts: NodeSpecificOpts,
+    pub node_opts: NodeSpecificOpts,
 }
 
 impl SingleNodeOpts {
