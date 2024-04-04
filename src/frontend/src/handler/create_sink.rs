@@ -763,6 +763,7 @@ static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, V
         use risingwave_connector::sink::kafka::KafkaSink;
         use risingwave_connector::sink::kinesis::KinesisSink;
         use risingwave_connector::sink::mqtt::MqttSink;
+        use risingwave_connector::sink::odf::OdfSink;
         use risingwave_connector::sink::pulsar::PulsarSink;
         use risingwave_connector::sink::redis::RedisSink;
         use risingwave_connector::sink::Sink as _;
@@ -779,6 +780,11 @@ static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, V
                     Format::Debezium => vec![Encode::Json],
                 ),
                 MqttSink::SINK_NAME => hashmap!(
+                    Format::Plain => vec![Encode::Json],
+                    Format::Upsert => vec![Encode::Json],
+                    Format::Debezium => vec![Encode::Json],
+                ),
+                OdfSink::SINK_NAME => hashmap!(
                     Format::Plain => vec![Encode::Json],
                     Format::Upsert => vec![Encode::Json],
                     Format::Debezium => vec![Encode::Json],

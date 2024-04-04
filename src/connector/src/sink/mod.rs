@@ -30,6 +30,7 @@ pub mod log_store;
 pub mod mock_coordination_client;
 pub mod mqtt;
 pub mod nats;
+pub mod odf;
 pub mod pulsar;
 pub mod redis;
 pub mod remote;
@@ -85,6 +86,7 @@ macro_rules! for_all_sinks {
                 { Iceberg, $crate::sink::iceberg::IcebergSink },
                 { Mqtt, $crate::sink::mqtt::MqttSink },
                 { Nats, $crate::sink::nats::NatsSink },
+                { Odf, $crate::sink::odf::OdfSink },
                 { Jdbc, $crate::sink::remote::JdbcSink },
                 { ElasticSearch, $crate::sink::remote::ElasticSearchSink },
                 { Cassandra, $crate::sink::remote::CassandraSink },
