@@ -37,9 +37,14 @@ async fn test_aggregation_inf_window_simple() {
                 2000-03-01,10
                 2000-03-02,-20
                 2000-03-03,10
-                2000-03-04,-10
-                "# // WM: 2000-03-05  (last elem included!)
+                2000-03-05,-10
+                "# // WM: 2000-03-04 (last elem delayed)
             ),
+            // No data
+            // WM: 2000-03-05 (last elem still delayed - no data in result)
+            //
+            // No data
+            // WM: 2000-03-06 (last elem is finally flushed)
         ],
     );
 
@@ -199,7 +204,7 @@ async fn test_aggregation_inf_window_simple() {
             data_paths: vec![input_dataset.data_slices[2].clone()],
             explicit_watermarks: vec![Watermark {
                 system_time: Utc.with_ymd_and_hms(2050, 1, 1, 0, 0, 0).unwrap(),
-                event_time: Utc.with_ymd_and_hms(2000, 3, 5, 0, 0, 0).unwrap(),
+                event_time: Utc.with_ymd_and_hms(2000, 3, 4, 0, 0, 0).unwrap(),
             }],
             ..input
         };
@@ -225,7 +230,6 @@ async fn test_aggregation_inf_window_simple() {
                 | 8      | 0  | 2050-01-01T12:00:00Z | 2000-03-01T00:00:00Z | 10    | 20      |
                 | 9      | 0  | 2050-01-01T12:00:00Z | 2000-03-02T00:00:00Z | -20   | 0       |
                 | 10     | 0  | 2050-01-01T12:00:00Z | 2000-03-03T00:00:00Z | 10    | 10      |
-                | 11     | 0  | 2050-01-01T12:00:00Z | 2000-03-04T00:00:00Z | -10   | 0       |
                 +--------+----+----------------------+----------------------+-------+---------+
                 "#
             ),
@@ -235,8 +239,90 @@ async fn test_aggregation_inf_window_simple() {
         assert_eq!(
             res,
             TransformResponseSuccess {
-                new_offset_interval: Some(OffsetInterval { start: 7, end: 11 }),
+                new_offset_interval: Some(OffsetInterval { start: 7, end: 10 }),
+                new_watermark: Some(Utc.with_ymd_and_hms(2000, 3, 4, 0, 0, 0).unwrap()),
+            }
+        );
+
+        tracing::warn!("================= ROUND 4 ==================");
+
+        let new_data_path = tempdir.path().join("data-4");
+        let prev_checkpoint_path = Some(new_checkpoint_path);
+        let new_checkpoint_path = tempdir.path().join("checkpoint-4");
+
+        let input = TransformRequestInput {
+            offset_interval: None,
+            data_paths: vec![],
+            explicit_watermarks: vec![Watermark {
+                system_time: Utc.with_ymd_and_hms(2050, 1, 1, 0, 0, 0).unwrap(),
+                event_time: Utc.with_ymd_and_hms(2000, 3, 5, 0, 0, 0).unwrap(),
+            }],
+            ..input
+        };
+        let request = TransformRequest {
+            query_inputs: vec![input.clone()],
+            next_offset: res.new_offset_interval.unwrap().end + 1,
+            prev_checkpoint_path,
+            new_checkpoint_path: new_checkpoint_path.clone(),
+            new_data_path: new_data_path.clone(),
+            ..request
+        };
+        let res = client.execute_transform(request.clone()).await.unwrap();
+
+        assert_eq!(
+            res,
+            TransformResponseSuccess {
+                new_offset_interval: None,
                 new_watermark: Some(Utc.with_ymd_and_hms(2000, 3, 5, 0, 0, 0).unwrap()),
+            }
+        );
+
+        assert!(!new_data_path.exists());
+
+        tracing::warn!("================= ROUND 5 ==================");
+
+        let new_data_path = tempdir.path().join("data-5");
+        let prev_checkpoint_path = Some(new_checkpoint_path);
+        let new_checkpoint_path = tempdir.path().join("checkpoint-5");
+
+        let input = TransformRequestInput {
+            offset_interval: None,
+            data_paths: vec![],
+            explicit_watermarks: vec![Watermark {
+                system_time: Utc.with_ymd_and_hms(2050, 1, 1, 0, 0, 0).unwrap(),
+                event_time: Utc.with_ymd_and_hms(2000, 3, 6, 0, 0, 0).unwrap(),
+            }],
+            ..input
+        };
+        let request = TransformRequest {
+            query_inputs: vec![input.clone()],
+            prev_checkpoint_path,
+            new_checkpoint_path: new_checkpoint_path.clone(),
+            new_data_path: new_data_path.clone(),
+            ..request
+        };
+        let res = client.execute_transform(request.clone()).await.unwrap();
+
+        df_utils::assert_parquet_eq(
+            &new_data_path,
+            expected_schema,
+            indoc!(
+                r#"
+                +--------+----+----------------------+----------------------+-------+---------+
+                | offset | op | system_time          | event_time           | delta | balance |
+                +--------+----+----------------------+----------------------+-------+---------+
+                | 11     | 0  | 2050-01-01T12:00:00Z | 2000-03-05T00:00:00Z | -10   | 0       |
+                +--------+----+----------------------+----------------------+-------+---------+
+                "#
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            res,
+            TransformResponseSuccess {
+                new_offset_interval: Some(OffsetInterval { start: 11, end: 11 }),
+                new_watermark: Some(Utc.with_ymd_and_hms(2000, 3, 6, 0, 0, 0).unwrap()),
             }
         );
     };

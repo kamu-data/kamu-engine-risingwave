@@ -10,6 +10,12 @@ IMAGE = ghcr.io/kamu-data/engine-risingwave:$(IMAGE_TAG)
 # Test
 ###############################################################################
 
+.PHONY: build
+build:
+	cd .. && ./risedev build
+	cd .. && cargo test -p kamu-engine-risingwave --no-run
+
+
 .PHONY: test
 test:
 	cd .. && \
@@ -19,7 +25,6 @@ test:
 		RW_ODF_SOURCE_DEBUG=1 \
 		RW_ODF_SINK_DEBUG=1 \
 		cargo test \
-		--profile dev \
 		-p kamu-engine-risingwave -- \
 		--test-threads=1 \
 		--nocapture
@@ -29,8 +34,8 @@ test:
 # Release
 ###############################################################################
 
-.PHONY: build
-build:
+.PHONY: build-release
+build-release:
 	# Build engine
 	cd .. && \
 		RUSTFLAGS="--cfg tokio_unstable" \

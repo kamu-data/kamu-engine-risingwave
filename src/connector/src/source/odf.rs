@@ -367,19 +367,6 @@ impl OdfSplitReader {
 
         let (mut offset, end_offset) = self.validate_input_assignment()?;
 
-        if offset == end_offset {
-            // Create marker
-            std::fs::write(&self.idle_marker_path, "")?;
-
-            tracing::info!(
-                split_id = %self.split.id,
-                start_offset = offset,
-                end_offset,
-                "Nothing to read",
-            );
-            return Ok(());
-        };
-
         tracing::info!(
             split_id = %self.split.id,
             start_offset = offset,
@@ -426,12 +413,12 @@ impl OdfSplitReader {
                     yield chunk;
                 }
             }
-
-            assert_eq!(
-                offset, end_offset,
-                "Exhausted available data without reaching the target end offset",
-            );
         }
+
+        assert_eq!(
+            offset, end_offset,
+            "Exhausted available data without reaching the target end offset",
+        );
 
         // TODO: Interlace watermarks into the chunk stream
         for wm in &self.input.explicit_watermarks {
