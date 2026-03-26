@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,61 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use risingwave_common::catalog::is_system_schema;
 use risingwave_common::types::DataType;
 use risingwave_sqlparser::ast::Ident;
 
 use crate::binder::{Binder, Clause};
 use crate::error::{ErrorCode, Result};
 use crate::expr::{CorrelatedInputRef, ExprImpl, ExprType, FunctionCall, InputRef, Literal};
-use crate::handler::create_sql_function::SQL_UDF_PATTERN;
 
 impl Binder {
     pub fn bind_column(&mut self, idents: &[Ident]) -> Result<ExprImpl> {
         // TODO: check quote style of `ident`.
-        let (_schema_name, table_name, column_name) = match idents {
+        let (schema_name, table_name, column_name) = match idents {
             [column] => (None, None, column.real_value()),
             [table, column] => (None, Some(table.real_value()), column.real_value()),
-            [schema, table, column] => (
-                Some(schema.real_value()),
-                Some(table.real_value()),
-                column.real_value(),
-            ),
+            [schema, table, column] => {
+                let schema_name = schema.real_value();
+                let relation_name = table.real_value();
+                if !is_system_schema(&schema_name) {
+                    let schema = self
+                        .catalog
+                        .get_schema_by_name(&self.db_name, &schema_name)
+                        .map_err(|_| {
+                            ErrorCode::InvalidReference(format!(
+                                "missing FROM-clause entry for table \"{}\"\n",
+                                relation_name
+                            ))
+                        })?;
+                    let relation_exists = schema.get_any_table_by_name(&relation_name).is_some()
+                        || schema.get_any_index_by_name(&relation_name).is_some()
+                        || schema.get_any_sink_by_name(&relation_name).is_some()
+                        || schema.get_source_by_name(&relation_name).is_some()
+                        || schema.get_view_by_name(&relation_name).is_some();
+                    if !relation_exists {
+                        return Err(ErrorCode::InvalidReference(format!(
+                            "missing FROM-clause entry for table \"{}\"\n",
+                            relation_name
+                        ))
+                        .into());
+                    }
+                }
+                (Some(schema_name), Some(relation_name), column.real_value())
+            }
             _ => {
                 return Err(
                     ErrorCode::InternalError(format!("Too many idents: {:?}", idents)).into(),
-                )
+                );
             }
         };
 
-        // Special check for sql udf
-        // Note: The check in `bind_column` is to inline the identifiers,
-        // which, in the context of sql udf, will NOT be perceived as normal
-        // columns, but the actual named input parameters.
-        // Thus, we need to figure out if the current "column name" corresponds
-        // to the name of the defined sql udf parameters stored in `udf_context`.
-        // If so, we will treat this bind as an special bind, the actual expression
-        // stored in `udf_context` will then be bound instead of binding the non-existing column.
-        if self.udf_context.global_count() != 0 {
-            if let Some(expr) = self.udf_context.get_expr(&column_name) {
-                return Ok(expr.clone());
-            } else {
-                // The reason that we directly return error here,
-                // is because during a valid sql udf binding,
-                // there will not exist any column identifiers
-                // And invalid cases should already be caught
-                // during semantic check phase
-                // Note: the error message here also help with hint display
-                // when invalid definition occurs at sql udf creation time
-                return Err(ErrorCode::BindError(format!(
-                    "{SQL_UDF_PATTERN} failed to find named parameter {column_name}"
-                ))
-                .into());
-            }
+        // If we find `sql_udf_arguments` in the current context, it means we're binding an inline SQL UDF
+        // (without a layer of subquery). This only happens when the function body is a trivial `SELECT`
+        // statement without any `FROM` clause etc. In this case, the column must be a UDF parameter.
+        if self.is_binding_inline_sql_udf() {
+            return self.bind_sql_udf_parameter(&column_name);
         }
 
         match self
             .context
-            .get_column_binding_indices(&table_name, &column_name)
+            .get_column_binding_indices(&schema_name, &table_name, &column_name)
         {
             Ok(mut indices) => {
                 match indices.len() {
@@ -92,9 +96,23 @@ impl Binder {
                 }
             }
             Err(e) => {
-                // If the error message is not that the column is not found, throw the error
+                // If a column is referenced using three-level qualification and the table has an alias,
+                // prompt the user to use the table alias instead.
                 if let ErrorCode::ItemNotFound(_) = e {
+                    if let (Some(schema), Some(table)) = (&schema_name, &table_name)
+                        && let Some(index) =
+                            self.context.get_table_alias(schema, table, &column_name)?
+                    {
+                        let column = &self.context.columns[index];
+                        return Err(ErrorCode::InvalidReference(format!(
+                            "missing FROM-clause entry for table \"{}\"\n\
+                            HINT:  Perhaps you meant to reference the table alias \"{}\".",
+                            table, column.table_name
+                        ))
+                        .into());
+                    };
                 } else {
+                    // If the error message is not that the column is not found, throw the error
                     return Err(e.into());
                 }
             }
@@ -111,7 +129,7 @@ impl Binder {
                 }
                 // input ref from lateral context `depth` starts from 1.
                 let depth = i + 1;
-                match context.get_column_binding_index(&table_name, &column_name) {
+                match context.get_column_binding_index(&schema_name, &table_name, &column_name) {
                     Ok(index) => {
                         let column = &context.columns[index];
                         return Ok(CorrelatedInputRef::new(
@@ -129,14 +147,14 @@ impl Binder {
         }
 
         for (i, (context, lateral_contexts)) in
-            self.upper_subquery_contexts.iter().rev().enumerate()
+            self.visible_upper_subquery_contexts_rev().enumerate()
         {
             if matches!(context.clause, Some(Clause::Insert)) {
                 continue;
             }
             // `depth` starts from 1.
             let depth = i + 1;
-            match context.get_column_binding_index(&table_name, &column_name) {
+            match context.get_column_binding_index(&schema_name, &table_name, &column_name) {
                 Ok(index) => {
                     let column = &context.columns[index];
                     return Ok(CorrelatedInputRef::new(
@@ -151,15 +169,16 @@ impl Binder {
                 }
             }
 
-            for (i, lateral_context) in lateral_contexts.iter().rev().enumerate() {
+            for (j, lateral_context) in lateral_contexts.iter().rev().enumerate() {
                 if lateral_context.is_visible {
                     let context = &lateral_context.context;
                     if matches!(context.clause, Some(Clause::Insert)) {
                         continue;
                     }
                     // correlated input ref from lateral context `depth` starts from 1.
-                    let depth = i + 1;
-                    match context.get_column_binding_index(&table_name, &column_name) {
+                    let depth = i + j + 1;
+                    match context.get_column_binding_index(&schema_name, &table_name, &column_name)
+                    {
                         Ok(index) => {
                             let column = &context.columns[index];
                             return Ok(CorrelatedInputRef::new(
@@ -176,6 +195,7 @@ impl Binder {
                 }
             }
         }
+
         // `CTID` is a system column in postgres.
         // https://www.postgresql.org/docs/current/ddl-system-columns.html
         //
@@ -189,6 +209,14 @@ impl Binder {
         {
             return Ok(Literal::new(Some("".into()), DataType::Varchar).into());
         }
+
+        // Failed to resolve the column in current context. Now check if it's a sql udf parameter.
+        if let ErrorCode::ItemNotFound(_) = err
+            && self.is_binding_subquery_sql_udf()
+        {
+            return self.bind_sql_udf_parameter(&column_name);
+        }
+
         Err(err.into())
     }
 }

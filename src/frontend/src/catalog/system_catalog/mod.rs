@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,35 +19,35 @@ pub mod rw_catalog;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use async_trait::async_trait;
-use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use risingwave_common::acl::AclMode;
 use risingwave_common::array::DataChunk;
 use risingwave_common::catalog::{
-    ColumnCatalog, ColumnDesc, Field, SysCatalogReader, TableDesc, TableId, DEFAULT_SUPER_USER_ID,
-    MAX_SYS_CATALOG_NUM, SYS_CATALOG_START_ID,
+    ColumnCatalog, ColumnDesc, DEFAULT_SUPER_USER_ID, Field, MAX_SYS_CATALOG_NUM,
+    SYS_CATALOG_START_ID, SysCatalogReader, TableId,
 };
 use risingwave_common::error::BoxedError;
-use risingwave_common::session_config::ConfigMap;
+use risingwave_common::id::ObjectId;
+use risingwave_common::metrics_reader::MetricsReader;
+use risingwave_common::session_config::SessionConfig;
 use risingwave_common::system_param::local_manager::SystemParamsReaderRef;
 use risingwave_common::types::DataType;
-use risingwave_pb::meta::list_table_fragment_states_response::TableFragmentState;
+use risingwave_pb::meta::list_streaming_job_states_response::StreamingJobState;
 use risingwave_pb::meta::table_parallelism::{PbFixedParallelism, PbParallelism};
-use risingwave_pb::user::grant_privilege::Object;
+use risingwave_pb::user::grant_privilege::Object as GrantObject;
 
 use crate::catalog::catalog_service::CatalogReader;
 use crate::catalog::view_catalog::ViewCatalog;
 use crate::meta_client::FrontendMetaClient;
-use crate::scheduler::worker_node_manager::WorkerNodeManagerRef;
 use crate::session::AuthContext;
+use crate::user::UserId;
 use crate::user::user_catalog::UserCatalog;
 use crate::user::user_privilege::available_prost_privilege;
 use crate::user::user_service::UserInfoReader;
-use crate::user::UserId;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 pub struct SystemTableCatalog {
     pub id: TableId,
 
@@ -60,7 +60,7 @@ pub struct SystemTableCatalog {
     pub pk: Vec<usize>,
 
     // owner of table, should always be default super user, keep it for compatibility.
-    pub owner: u32,
+    pub owner: UserId,
 
     /// description of table, set by `comment on`.
     pub description: Option<String>,
@@ -82,16 +82,6 @@ impl SystemTableCatalog {
         &self.columns
     }
 
-    /// Get a [`TableDesc`] of the system table.
-    pub fn table_desc(&self) -> TableDesc {
-        TableDesc {
-            table_id: self.id,
-            columns: self.columns.iter().map(|c| c.column_desc.clone()).collect(),
-            stream_key: self.pk.clone(),
-            ..Default::default()
-        }
-    }
-
     /// Get a reference to the system catalog's name.
     pub fn name(&self) -> &str {
         self.name.as_ref()
@@ -103,36 +93,36 @@ pub struct SysCatalogReaderImpl {
     catalog_reader: CatalogReader,
     // Read user info.
     user_info_reader: UserInfoReader,
-    // Read cluster info.
-    worker_node_manager: WorkerNodeManagerRef,
     // Read from meta.
     meta_client: Arc<dyn FrontendMetaClient>,
     // Read auth context.
     auth_context: Arc<AuthContext>,
     // Read config.
-    config: Arc<RwLock<ConfigMap>>,
+    config: Arc<RwLock<SessionConfig>>,
     // Read system params.
     system_params: SystemParamsReaderRef,
+    // Read metrics.
+    pub(super) metrics_reader: Arc<dyn MetricsReader>,
 }
 
 impl SysCatalogReaderImpl {
     pub fn new(
         catalog_reader: CatalogReader,
         user_info_reader: UserInfoReader,
-        worker_node_manager: WorkerNodeManagerRef,
         meta_client: Arc<dyn FrontendMetaClient>,
         auth_context: Arc<AuthContext>,
-        config: Arc<RwLock<ConfigMap>>,
+        config: Arc<RwLock<SessionConfig>>,
         system_params: SystemParamsReaderRef,
+        metrics_reader: Arc<dyn MetricsReader>,
     ) -> Self {
         Self {
             catalog_reader,
             user_info_reader,
-            worker_node_manager,
             meta_client,
             auth_context,
             config,
             system_params,
+            metrics_reader,
         }
     }
 }
@@ -142,7 +132,7 @@ pub struct BuiltinTable {
     schema: &'static str,
     columns: Vec<SystemCatalogColumnsDef<'static>>,
     pk: &'static [usize],
-    function: for<'a> fn(&'a SysCatalogReaderImpl) -> BoxFuture<'a, Result<DataChunk, BoxedError>>,
+    function: for<'a> fn(&'a SysCatalogReaderImpl) -> BoxStream<'a, Result<DataChunk, BoxedError>>,
 }
 
 pub struct BuiltinView {
@@ -170,13 +160,13 @@ impl From<&BuiltinTable> for SystemTableCatalog {
     fn from(val: &BuiltinTable) -> Self {
         SystemTableCatalog {
             id: TableId::placeholder(),
-            name: val.name.to_string(),
+            name: val.name.to_owned(),
             columns: val
                 .columns
                 .iter()
                 .enumerate()
                 .map(|(idx, (name, ty))| ColumnCatalog {
-                    column_desc: ColumnDesc::new_atomic(ty.clone(), name, idx as i32),
+                    column_desc: ColumnDesc::named(*name, (idx as i32).into(), ty.clone()),
                     is_hidden: false,
                 })
                 .collect(),
@@ -190,8 +180,10 @@ impl From<&BuiltinTable> for SystemTableCatalog {
 impl From<&BuiltinView> for ViewCatalog {
     fn from(val: &BuiltinView) -> Self {
         ViewCatalog {
-            id: 0,
-            name: val.name.to_string(),
+            id: 0.into(),
+            name: val.name.to_owned(),
+            schema_id: 0.into(),
+            database_id: 0.into(),
             columns: val
                 .columns
                 .iter()
@@ -200,6 +192,8 @@ impl From<&BuiltinView> for ViewCatalog {
             sql: val.sql.clone(),
             owner: DEFAULT_SUPER_USER_ID,
             properties: Default::default(),
+            created_at_epoch: None,
+            created_at_cluster_version: None,
         }
     }
 }
@@ -222,38 +216,38 @@ pub fn infer_dummy_view_sql(columns: &[SystemCatalogColumnsDef<'_>]) -> String {
     )
 }
 
-fn extract_parallelism_from_table_state(state: &TableFragmentState) -> String {
+fn extract_parallelism_from_table_state(state: &StreamingJobState) -> String {
     match state
         .parallelism
         .as_ref()
         .and_then(|parallelism| parallelism.parallelism.as_ref())
     {
-        Some(PbParallelism::Auto(_)) | Some(PbParallelism::Adaptive(_)) => "adaptive".to_string(),
+        Some(PbParallelism::Auto(_)) | Some(PbParallelism::Adaptive(_)) => "adaptive".to_owned(),
         Some(PbParallelism::Fixed(PbFixedParallelism { parallelism })) => {
             format!("fixed({parallelism})")
         }
-        Some(PbParallelism::Custom(_)) => "custom".to_string(),
-        None => "unknown".to_string(),
+        Some(PbParallelism::Custom(_)) => "custom".to_owned(),
+        None => "unknown".to_owned(),
     }
 }
 
 /// get acl items of `object` in string, ignore public.
 fn get_acl_items(
-    object: &Object,
+    object: impl Into<GrantObject>,
     for_dml_table: bool,
     users: &Vec<UserCatalog>,
     username_map: &HashMap<UserId, String>,
-) -> String {
-    let mut res = String::from("{");
-    let mut empty_flag = true;
-    let super_privilege = available_prost_privilege(object.clone(), for_dml_table);
+) -> Vec<String> {
+    let object = object.into();
+    let mut res = vec![];
+    let super_privilege = available_prost_privilege(object, for_dml_table);
     for user in users {
         let privileges = if user.is_super {
             vec![&super_privilege]
         } else {
             user.grant_privileges
                 .iter()
-                .filter(|&privilege| privilege.object.as_ref().unwrap() == object)
+                .filter(|&privilege| privilege.object.as_ref().unwrap() == &object)
                 .collect_vec()
         };
         if privileges.is_empty() {
@@ -269,25 +263,21 @@ fn get_acl_items(
             })
         });
         for (granted_by, actions) in grantor_map {
-            if empty_flag {
-                empty_flag = false;
-            } else {
-                res.push(',');
-            }
-            res.push_str(&user.name);
-            res.push('=');
+            let mut aclitem = String::new();
+            aclitem.push_str(&user.name);
+            aclitem.push('=');
             for (action, option) in actions {
-                res.push_str(&AclMode::from(action).to_string());
+                aclitem.push_str(&AclMode::from(action).to_string());
                 if option {
-                    res.push('*');
+                    aclitem.push('*');
                 }
             }
-            res.push('/');
+            aclitem.push('/');
             // should be able to query grantor's name
-            res.push_str(username_map.get(&granted_by).unwrap());
+            aclitem.push_str(username_map.get(&granted_by).unwrap());
+            res.push(aclitem);
         }
     }
-    res.push('}');
     res
 }
 
@@ -311,18 +301,22 @@ pub fn get_sys_tables_in_schema(schema_name: &str) -> Vec<Arc<SystemTableCatalog
         .collect()
 }
 
-pub fn get_sys_views_in_schema(schema_name: &str) -> Vec<Arc<ViewCatalog>> {
+pub fn get_sys_views_in_schema(schema_name: &str) -> Vec<ViewCatalog> {
     SYS_CATALOGS
         .catalogs
         .iter()
         .enumerate()
         .filter_map(|(idx, c)| match c {
-            BuiltinCatalog::View(v) if v.schema == schema_name => Some(Arc::new(
-                ViewCatalog::from(v).with_id(idx as u32 + SYS_CATALOG_START_ID as u32),
-            )),
+            BuiltinCatalog::View(v) if v.schema == schema_name => Some(
+                ViewCatalog::from(v).with_id((idx as u32 + SYS_CATALOG_START_ID as u32).into()),
+            ),
             _ => None,
         })
         .collect()
+}
+
+pub fn is_system_catalog(oid: ObjectId) -> bool {
+    oid.as_raw_id() >= SYS_CATALOG_START_ID as u32
 }
 
 /// The global registry of all builtin catalogs.
@@ -340,18 +334,15 @@ pub static SYS_CATALOGS: LazyLock<SystemCatalog> = LazyLock::new(|| {
 #[linkme::distributed_slice]
 pub static SYS_CATALOGS_SLICE: [fn() -> BuiltinCatalog];
 
-#[async_trait]
 impl SysCatalogReader for SysCatalogReaderImpl {
-    async fn read_table(&self, table_id: &TableId) -> Result<DataChunk, BoxedError> {
+    fn read_table(&self, table_id: TableId) -> BoxStream<'_, Result<DataChunk, BoxedError>> {
         let table_name = SYS_CATALOGS
             .catalogs
-            .get((table_id.table_id - SYS_CATALOG_START_ID as u32) as usize)
+            .get((table_id.as_raw_id() - SYS_CATALOG_START_ID as u32) as usize)
             .unwrap();
         match table_name {
-            BuiltinCatalog::Table(t) => (t.function)(self).await,
-            BuiltinCatalog::View(_) => {
-                panic!("read_table should not be called on a view")
-            }
+            BuiltinCatalog::Table(t) => (t.function)(self),
+            BuiltinCatalog::View(_) => panic!("read_table should not be called on a view"),
         }
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,17 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::pin::pin;
-
 use futures::channel::{mpsc, oneshot};
+use futures::stream;
 use futures::stream::select_with_strategy;
-use futures::{stream, StreamExt};
-use futures_async_stream::try_stream;
-use risingwave_common::array::StreamChunk;
 
-use super::error::StreamExecutorError;
-use super::{expect_first_barrier, Barrier, Execute, Executor, Message, MessageStream};
-use crate::task::{ActorId, CreateMviewProgress};
+use crate::executor::prelude::*;
+use crate::task::CreateMviewProgressReporter;
 
 /// `ChainExecutor` is an executor that enables synchronization between the existing stream and
 /// newly appended executors. Currently, `ChainExecutor` is mainly used to implement MV on MV
@@ -36,7 +31,7 @@ pub struct RearrangedChainExecutor {
 
     upstream: Executor,
 
-    progress: CreateMviewProgress,
+    progress: CreateMviewProgressReporter,
 
     actor_id: ActorId,
 }
@@ -79,7 +74,11 @@ impl RearrangedMessage {
 }
 
 impl RearrangedChainExecutor {
-    pub fn new(snapshot: Executor, upstream: Executor, progress: CreateMviewProgress) -> Self {
+    pub fn new(
+        snapshot: Executor,
+        upstream: Executor,
+        progress: CreateMviewProgressReporter,
+    ) -> Self {
         Self {
             snapshot,
             upstream,
@@ -122,11 +121,10 @@ impl RearrangedChainExecutor {
 
             {
                 // 3. Rearrange stream, will yield the barriers polled from upstream to rearrange.
-                let rearranged_barrier =
-                    pin!(
-                        Self::rearrange_barrier(&mut upstream, upstream_tx, stop_rearrange_rx)
-                            .map(|result| result.map(RearrangedMessage::RearrangedBarrier)),
-                    );
+                let rearranged_barrier = pin!(
+                    Self::rearrange_barrier(&mut upstream, upstream_tx, stop_rearrange_rx)
+                        .map(|result| result.map(RearrangedMessage::RearrangedBarrier)),
+                );
 
                 // 4. Init the snapshot with reading epoch.
                 let snapshot = self.snapshot.execute_with_epoch(create_epoch.prev);
@@ -160,7 +158,7 @@ impl RearrangedChainExecutor {
                             // Update the progress since we've consumed all chunks before this
                             // phantom.
                             self.progress.update(
-                                last_rearranged_epoch.curr,
+                                last_rearranged_epoch,
                                 barrier.epoch.curr,
                                 processed_rows,
                             );
@@ -206,7 +204,7 @@ impl RearrangedChainExecutor {
                         continue;
                     };
                     if let Some(barrier) = msg.as_barrier() {
-                        self.progress.finish(barrier.epoch.curr, processed_rows);
+                        self.progress.finish(barrier.epoch, processed_rows);
                     }
                     yield msg;
                 }
@@ -219,7 +217,7 @@ impl RearrangedChainExecutor {
             for msg in upstream {
                 let msg: Message = msg?;
                 if let Some(barrier) = msg.as_barrier() {
-                    self.progress.finish(barrier.epoch.curr, processed_rows);
+                    self.progress.finish(barrier.epoch, processed_rows);
                 }
                 yield msg;
             }
@@ -247,13 +245,13 @@ impl RearrangedChainExecutor {
         U: MessageStream + std::marker::Unpin,
     {
         loop {
-            use futures::future::{select, Either};
+            use futures::future::{Either, select};
 
             // Stop when `stop_rearrange_rx` is received.
             match select(&mut stop_rearrange_rx, upstream.next()).await {
                 Either::Left((Ok(_), _)) => break,
                 Either::Left((Err(_e), _)) => {
-                    return Err(StreamExecutorError::channel_closed("stop rearrange"))
+                    return Err(StreamExecutorError::channel_closed("stop rearrange"));
                 }
 
                 Either::Right((Some(msg), _)) => {

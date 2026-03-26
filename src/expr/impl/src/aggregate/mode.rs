@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ use risingwave_common_estimate_size::EstimateSize;
 use risingwave_expr::aggregate::{
     AggCall, AggStateDyn, AggregateFunction, AggregateState, BoxedAggregateFunction,
 };
-use risingwave_expr::{build_aggregate, Result};
+use risingwave_expr::{Result, build_aggregate};
 
 #[build_aggregate("mode(any) -> any")]
 fn build(agg: &AggCall) -> Result<BoxedAggregateFunction> {
@@ -101,8 +101,8 @@ impl AggregateFunction for Mode {
         self.return_type.clone()
     }
 
-    fn create_state(&self) -> AggregateState {
-        AggregateState::Any(Box::<State>::default())
+    fn create_state(&self) -> Result<AggregateState> {
+        Ok(AggregateState::Any(Box::<State>::default()))
     }
 
     async fn update(&self, state: &mut AggregateState, input: &StreamChunk) -> Result<()> {

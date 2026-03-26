@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConnectorResult;
 use crate::source::cdc::external::DebeziumOffset;
-use crate::source::cdc::{CdcSourceType, CdcSourceTypeTrait};
+use crate::source::cdc::{CdcSourceType, CdcSourceTypeTrait, Mysql, Postgres, SqlServer};
 use crate::source::{SplitId, SplitMetaData};
 
 /// The base states of a CDC split, which will be persisted to checkpoint.
@@ -46,7 +46,7 @@ trait CdcSplitTrait: Send + Sync {
     fn split_id(&self) -> u32;
     fn start_offset(&self) -> &Option<String>;
     fn is_snapshot_done(&self) -> bool;
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()>;
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()>;
 
     // MySQL and MongoDB shares the same logic to extract the snapshot flag
     fn extract_snapshot_flag(&self, start_offset: &str) -> ConnectorResult<bool> {
@@ -92,6 +92,11 @@ pub struct MongoDbCdcSplit {
     pub inner: CdcSplitBase,
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Hash)]
+pub struct SqlServerCdcSplit {
+    pub inner: CdcSplitBase,
+}
+
 impl MySqlCdcSplit {
     pub fn new(split_id: u32, start_offset: Option<String>) -> Self {
         let split = CdcSplitBase {
@@ -100,6 +105,37 @@ impl MySqlCdcSplit {
             snapshot_done: false,
         };
         Self { inner: split }
+    }
+
+    /// Extract MySQL CDC binlog offset (file sequence and position) from the offset JSON string.
+    ///
+    /// MySQL binlog offset format:
+    /// ```json
+    /// {
+    ///   "sourcePartition": { "server": "..." },
+    ///   "sourceOffset": {
+    ///     "file": "binlog.000123",
+    ///     "pos": 456789,
+    ///     ...
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// Returns `Some((file_seq, position))` where:
+    /// - `file_seq`: the numeric part of binlog filename (e.g., 123 from "binlog.000123")
+    /// - `position`: the byte offset within the binlog file
+    pub fn mysql_binlog_offset(&self) -> Option<(u64, u64)> {
+        let offset_str = self.inner.start_offset.as_ref()?;
+        let offset = serde_json::from_str::<serde_json::Value>(offset_str).ok()?;
+        let source_offset = offset.get("sourceOffset")?;
+
+        let file = source_offset.get("file")?.as_str()?;
+        let pos = source_offset.get("pos")?.as_u64()?;
+
+        // Extract numeric sequence from "binlog.NNNNNN"
+        let file_seq = file.strip_prefix("binlog.")?.parse::<u64>().ok()?;
+
+        Some((file_seq, pos))
     }
 }
 
@@ -116,10 +152,10 @@ impl CdcSplitTrait for MySqlCdcSplit {
         self.inner.snapshot_done
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
         // if snapshot_done is already true, it won't be updated
-        self.inner.snapshot_done = self.extract_snapshot_flag(start_offset.as_str())?;
-        self.inner.start_offset = Some(start_offset);
+        self.inner.snapshot_done = self.extract_snapshot_flag(last_seen_offset.as_str())?;
+        self.inner.start_offset = Some(last_seen_offset);
         Ok(())
     }
 }
@@ -136,6 +172,18 @@ impl PostgresCdcSplit {
             server_addr,
         }
     }
+
+    /// Extract PostgreSQL LSN value from the offset JSON string.
+    ///
+    /// This function parses the offset JSON and extracts the LSN value from the sourceOffset.lsn field.
+    /// Returns Some(lsn) if the LSN is found and can be parsed as u64, None otherwise.
+    pub fn pg_lsn(&self) -> Option<u64> {
+        let offset_str = self.inner.start_offset.as_ref()?;
+        let offset = serde_json::from_str::<serde_json::Value>(offset_str).ok()?;
+        let source_offset = offset.get("sourceOffset")?;
+        let lsn = source_offset.get("lsn")?;
+        lsn.as_u64()
+    }
 }
 
 impl CdcSplitTrait for PostgresCdcSplit {
@@ -151,9 +199,9 @@ impl CdcSplitTrait for PostgresCdcSplit {
         self.inner.snapshot_done
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
-        self.inner.snapshot_done = self.extract_snapshot_flag(start_offset.as_str())?;
-        self.inner.start_offset = Some(start_offset);
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        self.inner.snapshot_done = self.extract_snapshot_flag(last_seen_offset.as_str())?;
+        self.inner.start_offset = Some(last_seen_offset);
         Ok(())
     }
 
@@ -206,10 +254,54 @@ impl CdcSplitTrait for MongoDbCdcSplit {
         self.inner.snapshot_done
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
         // if snapshot_done is already true, it will remain true
-        self.inner.snapshot_done = self.extract_snapshot_flag(start_offset.as_str())?;
-        self.inner.start_offset = Some(start_offset);
+        self.inner.snapshot_done = self.extract_snapshot_flag(last_seen_offset.as_str())?;
+        self.inner.start_offset = Some(last_seen_offset);
+        Ok(())
+    }
+}
+
+impl SqlServerCdcSplit {
+    pub fn new(split_id: u32, start_offset: Option<String>) -> Self {
+        let split = CdcSplitBase {
+            split_id,
+            start_offset,
+            snapshot_done: false,
+        };
+        Self { inner: split }
+    }
+
+    /// Extract SQL Server `change_lsn` value from the offset JSON string.
+    pub fn sql_server_change_lsn(&self) -> Option<u128> {
+        let offset_str = self.inner.start_offset.as_ref()?;
+        extract_sql_server_change_lsn_from_offset_str(offset_str)
+    }
+
+    /// Extract SQL Server `commit_lsn` value from the offset JSON string.
+    pub fn sql_server_commit_lsn(&self) -> Option<u128> {
+        let offset_str = self.inner.start_offset.as_ref()?;
+        extract_sql_server_commit_lsn_from_offset_str(offset_str)
+    }
+}
+
+impl CdcSplitTrait for SqlServerCdcSplit {
+    fn split_id(&self) -> u32 {
+        self.inner.split_id
+    }
+
+    fn start_offset(&self) -> &Option<String> {
+        &self.inner.start_offset
+    }
+
+    fn is_snapshot_done(&self) -> bool {
+        self.inner.snapshot_done
+    }
+
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        // if snapshot_done is already true, it will remain true
+        self.inner.snapshot_done = self.extract_snapshot_flag(last_seen_offset.as_str())?;
+        self.inner.start_offset = Some(last_seen_offset);
         Ok(())
     }
 }
@@ -223,18 +315,19 @@ pub struct DebeziumCdcSplit<T: CdcSourceTypeTrait> {
     pub postgres_split: Option<PostgresCdcSplit>,
     pub citus_split: Option<PostgresCdcSplit>,
     pub mongodb_split: Option<MongoDbCdcSplit>,
+    pub sql_server_split: Option<SqlServerCdcSplit>,
 
     #[serde(skip)]
     pub _phantom: PhantomData<T>,
 }
 
 macro_rules! dispatch_cdc_split_inner {
-    ($dbz_split:expr, $as_type:tt, {$($cdc_source_type:tt),*}, $body:expr) => {
+    ($dbz_split:expr, $as_type:tt, {$({$cdc_source_type:tt, $cdc_source_split:tt}),*}, $body:expr) => {
         match T::source_type() {
             $(
                 CdcSourceType::$cdc_source_type => {
                     $crate::paste! {
-                        $dbz_split.[<$cdc_source_type:lower _split>]
+                        $dbz_split.[<$cdc_source_split>]
                             .[<as_ $as_type>]()
                             .expect(concat!(stringify!([<$cdc_source_type:lower>]), " split must exist"))
                             .$body
@@ -251,7 +344,13 @@ macro_rules! dispatch_cdc_split_inner {
 // call corresponding split method of the specific cdc source type
 macro_rules! dispatch_cdc_split {
     ($dbz_split:expr, $as_type:tt, $body:expr) => {
-      dispatch_cdc_split_inner!($dbz_split, $as_type, {Mysql, Postgres, Citus, Mongodb}, $body)
+        dispatch_cdc_split_inner!($dbz_split, $as_type, {
+            {Mysql, mysql_split},
+            {Postgres, postgres_split},
+            {Citus, citus_split},
+            {Mongodb, mongodb_split},
+            {SqlServer, sql_server_split}
+        }, $body)
     }
 }
 
@@ -268,8 +367,8 @@ impl<T: CdcSourceTypeTrait> SplitMetaData for DebeziumCdcSplit<T> {
         serde_json::from_value(value.take()).map_err(Into::into)
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
-        self.update_with_offset(start_offset)
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        self.update_offset_inner(last_seen_offset)
     }
 }
 
@@ -280,6 +379,7 @@ impl<T: CdcSourceTypeTrait> DebeziumCdcSplit<T> {
             postgres_split: None,
             citus_split: None,
             mongodb_split: None,
+            sql_server_split: None,
             _phantom: PhantomData,
         };
         match T::source_type() {
@@ -298,6 +398,10 @@ impl<T: CdcSourceTypeTrait> DebeziumCdcSplit<T> {
             CdcSourceType::Mongodb => {
                 let split = MongoDbCdcSplit::new(split_id, start_offset);
                 ret.mongodb_split = Some(split);
+            }
+            CdcSourceType::SqlServer => {
+                let split = SqlServerCdcSplit::new(split_id, start_offset);
+                ret.sql_server_split = Some(split);
             }
             CdcSourceType::Unspecified => {
                 unreachable!("invalid debezium split")
@@ -318,8 +422,111 @@ impl<T: CdcSourceTypeTrait> DebeziumCdcSplit<T> {
         dispatch_cdc_split!(self, ref, is_snapshot_done())
     }
 
-    pub fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
-        dispatch_cdc_split!(self, mut, update_with_offset(start_offset)?);
+    pub fn update_offset_inner(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        dispatch_cdc_split!(self, mut, update_offset(last_seen_offset)?);
         Ok(())
+    }
+}
+
+impl DebeziumCdcSplit<Postgres> {
+    /// Extract PostgreSQL LSN value from the current split offset.
+    ///
+    /// Returns Some(lsn) if the LSN is found and can be parsed as u64, None otherwise.
+    pub fn pg_lsn(&self) -> Option<u64> {
+        self.postgres_split.as_ref()?.pg_lsn()
+    }
+}
+
+impl DebeziumCdcSplit<Mysql> {
+    /// Extract MySQL CDC binlog offset (file sequence and position) from the current split offset.
+    ///
+    /// Returns `Some((file_seq, position))` where:
+    /// - `file_seq`: the numeric part of binlog filename (e.g., 123 from "binlog.000123")
+    /// - `position`: the byte offset within the binlog file
+    pub fn mysql_binlog_offset(&self) -> Option<(u64, u64)> {
+        self.mysql_split.as_ref()?.mysql_binlog_offset()
+    }
+}
+
+impl DebeziumCdcSplit<SqlServer> {
+    /// Extract SQL Server CDC `change_lsn` from the current split offset.
+    pub fn sql_server_change_lsn(&self) -> Option<u128> {
+        self.sql_server_split.as_ref()?.sql_server_change_lsn()
+    }
+
+    /// Extract SQL Server CDC `commit_lsn` from the current split offset.
+    pub fn sql_server_commit_lsn(&self) -> Option<u128> {
+        self.sql_server_split.as_ref()?.sql_server_commit_lsn()
+    }
+}
+
+/// Extract PostgreSQL LSN value from a CDC offset JSON string.
+///
+/// This is a standalone helper function that can be used when you only have the offset string
+/// (e.g., in callbacks) and don't have access to the Split object.
+///
+/// Returns Some(lsn) if the LSN is found and can be parsed as u64, None otherwise.
+pub fn extract_postgres_lsn_from_offset_str(offset_str: &str) -> Option<u64> {
+    let offset = serde_json::from_str::<serde_json::Value>(offset_str).ok()?;
+    let source_offset = offset.get("sourceOffset")?;
+    let lsn = source_offset.get("lsn")?;
+    lsn.as_u64()
+}
+
+/// Parse SQL Server LSN string (`XXXXXXXX:XXXXXXXX:XXXX`) into a comparable integer.
+pub fn parse_sql_server_lsn_str(lsn: &str) -> Option<u128> {
+    let mut parts = lsn.split(':');
+    let part0 = u32::from_str_radix(parts.next()?, 16).ok()? as u128;
+    let part1 = u32::from_str_radix(parts.next()?, 16).ok()? as u128;
+    let part2 = u16::from_str_radix(parts.next()?, 16).ok()? as u128;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some((part0 << 48) | (part1 << 16) | part2)
+}
+
+/// Extract SQL Server `change_lsn` from a CDC offset JSON string.
+pub fn extract_sql_server_change_lsn_from_offset_str(offset_str: &str) -> Option<u128> {
+    let offset = serde_json::from_str::<serde_json::Value>(offset_str).ok()?;
+    let source_offset = offset.get("sourceOffset")?;
+    let lsn = source_offset.get("change_lsn")?.as_str()?;
+    parse_sql_server_lsn_str(lsn)
+}
+
+/// Extract SQL Server `commit_lsn` from a CDC offset JSON string.
+pub fn extract_sql_server_commit_lsn_from_offset_str(offset_str: &str) -> Option<u128> {
+    let offset = serde_json::from_str::<serde_json::Value>(offset_str).ok()?;
+    let source_offset = offset.get("sourceOffset")?;
+    let lsn = source_offset.get("commit_lsn")?.as_str()?;
+    parse_sql_server_lsn_str(lsn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_sql_server_lsn_str() {
+        let lsn = "00000027:00000ac0:0002";
+        let parsed = parse_sql_server_lsn_str(lsn).unwrap();
+        let expected = ((0x00000027_u128) << 48) | ((0x00000ac0_u128) << 16) | (0x0002_u128);
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn test_extract_sql_server_lsn_from_offset_str() {
+        let offset = r#"{
+            "sourcePartition": {"server":"RW_CDC_1001"},
+            "sourceOffset": {
+                "change_lsn":"00000027:00000ac0:0001",
+                "commit_lsn":"00000027:00000ac0:0002"
+            },
+            "isHeartbeat": false
+        }"#;
+
+        let change_lsn = extract_sql_server_change_lsn_from_offset_str(offset).unwrap();
+        let commit_lsn = extract_sql_server_commit_lsn_from_offset_str(offset).unwrap();
+        assert!(change_lsn < commit_lsn);
     }
 }

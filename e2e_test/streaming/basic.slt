@@ -32,6 +32,9 @@ statement ok
 insert into t5 values ('-inf');
 
 statement ok
+flush;
+
+statement ok
 create materialized view mv1 as select * from t1;
 
 statement ok
@@ -146,4 +149,10 @@ drop materialized view mv
 
 statement ok
 drop table t
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS SELECT random();
+
+statement ok
+drop materialized view mv
 

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 use risingwave_common::types::{Fields, JsonbVal};
 use risingwave_frontend_macro::system_catalog;
+use risingwave_pb::id::CompactionGroupId;
 use serde_json::json;
 
 use crate::catalog::system_catalog::SysCatalogReaderImpl;
@@ -22,13 +23,12 @@ use crate::error::Result;
 #[derive(Fields)]
 struct RwHummockCompactTaskAssignment {
     #[primary_key]
-    compaction_group_id: i64,
+    compaction_group_id: CompactionGroupId,
     task_id: i64,
     select_level: i32,
     target_level: i32,
     task_type: i32,
     task_status: i32,
-    watermark: i64,
     base_level: i32,
     gc_delete_keys: bool,
     target_file_size: i64,
@@ -49,13 +49,12 @@ async fn read(reader: &SysCatalogReaderImpl) -> Result<Vec<RwHummockCompactTaskA
         let select_level = compact_task.input_ssts[0].level_idx;
 
         rows.push(RwHummockCompactTaskAssignment {
-            compaction_group_id: compact_task.compaction_group_id as _,
+            compaction_group_id: compact_task.compaction_group_id,
             task_id: compact_task.task_id as _,
             select_level: select_level as _,
             target_level: compact_task.target_level as _,
             task_type: compact_task.task_type as _,
             task_status: compact_task.task_status as _,
-            watermark: compact_task.watermark as _,
             base_level: compact_task.base_level as _,
             gc_delete_keys: compact_task.gc_delete_keys as _,
             target_file_size: compact_task.target_file_size as _,

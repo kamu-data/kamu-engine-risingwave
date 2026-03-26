@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::session_config::OverWindowCachePolicy;
-use risingwave_expr::aggregate::{AggArgs, AggKind};
+use risingwave_common::config::streaming::OverWindowCachePolicy;
+use risingwave_expr::aggregate::{AggArgs, PbAggKind};
 use risingwave_expr::window_function::{
     Frame, FrameBound, FrameExclusion, WindowFuncCall, WindowFuncKind,
 };
+use risingwave_stream::common::table::test_utils::gen_pbtable;
 use risingwave_stream::executor::monitor::StreamingMetrics;
 use risingwave_stream::executor::{OverWindowExecutor, OverWindowExecutorArgs};
 
@@ -32,7 +33,7 @@ async fn create_executor<S: StateStore>(
         Field::unnamed(DataType::Int64),   // pk
         Field::unnamed(DataType::Int32),   // x
     ]);
-    let input_pk_indices = vec![2];
+    let input_stream_key = vec![2];
     let partition_key_indices = vec![1];
     let order_key_indices = vec![0];
     let order_key_order_types = vec![OrderType::ascending()];
@@ -64,17 +65,21 @@ async fn create_executor<S: StateStore>(
         Schema { fields }
     };
 
-    let state_table = StateTable::new_without_distribution(
+    let state_table = StateTable::from_table_catalog(
+        &gen_pbtable(
+            TableId::new(1),
+            table_columns,
+            table_order_types,
+            table_pk_indices,
+            0,
+        ),
         store,
-        TableId::new(1),
-        table_columns,
-        table_order_types,
-        table_pk_indices,
+        None,
     )
     .await;
 
     let (tx, source) = MockSource::channel();
-    let source = source.into_executor(input_schema, input_pk_indices.clone());
+    let source = source.into_executor(input_schema, input_stream_key.clone());
     let executor = OverWindowExecutor::new(OverWindowExecutorArgs {
         actor_ctx: ActorContext::for_test(123),
 
@@ -104,16 +109,18 @@ async fn test_over_window_lag_lead_append_only() {
     let calls = vec![
         // lag(x, 1)
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::FirstValue),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::FirstValue.into()),
             return_type: DataType::Int32,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows(FrameBound::Preceding(1), FrameBound::Preceding(1)),
         },
         // lead(x, 1)
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::FirstValue),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::FirstValue.into()),
             return_type: DataType::Int32,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows(FrameBound::Following(1), FrameBound::Following(1)),
         },
     ];
@@ -131,11 +138,11 @@ async fn test_over_window_lag_lead_append_only() {
             + 5 p1 102 18
         - !barrier 2
         - recovery
-        - !barrier 3
+        - !barrier 2
         - !chunk |2
               I  T  I   i
             + 10 p1 103 13
-        - !barrier 4
+        - !barrier 3
         "###,
         expect![[r#"
             - input: !barrier 1
@@ -179,9 +186,9 @@ async fn test_over_window_lag_lead_append_only() {
               - !barrier 2
             - input: recovery
               output: []
-            - input: !barrier 3
+            - input: !barrier 2
               output:
-              - !barrier 3
+              - !barrier 2
             - input: !chunk |-
                 +---+----+----+-----+----+
                 | + | 10 | p1 | 103 | 13 |
@@ -200,9 +207,9 @@ async fn test_over_window_lag_lead_append_only() {
                 | 5  | p1 | 102 | 18 | 16 | 13 |
                 | 10 | p1 | 103 | 13 | 18 |    |
                 +----+----+-----+----+----+----+
-            - input: !barrier 4
+            - input: !barrier 3
               output:
-              - !barrier 4
+              - !barrier 3
         "#]],
         snapshot_options(),
     )
@@ -215,16 +222,18 @@ async fn test_over_window_lag_lead_with_updates() {
     let calls = vec![
         // lag(x, 1)
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::FirstValue),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::FirstValue.into()),
             return_type: DataType::Int32,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows(FrameBound::Preceding(1), FrameBound::Preceding(1)),
         },
         // lead(x, 1)
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::FirstValue),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::FirstValue.into()),
             return_type: DataType::Int32,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows(FrameBound::Following(1), FrameBound::Following(1)),
         },
     ];
@@ -248,19 +257,19 @@ async fn test_over_window_lag_lead_with_updates() {
             + 6 p2 203 23
         - !barrier 2
         - recovery
-        - !barrier 3
+        - !barrier 2
         - !chunk |2
               I T  I   i
             - 6 p2 203 23
            U- 2 p1 101 16
            U+ 2 p2 101 16 // a partition-change update
-        - !barrier 4
+        - !barrier 3
         - recovery
-        - !barrier 5
+        - !barrier 3
         - !chunk |2
               I  T  I   i
             + 10 p3 300 30
-        - !barrier 6
+        - !barrier 4
         "###,
         expect![[r#"
             - input: !barrier 1
@@ -319,9 +328,9 @@ async fn test_over_window_lag_lead_with_updates() {
               - !barrier 2
             - input: recovery
               output: []
-            - input: !barrier 3
+            - input: !barrier 2
               output:
-              - !barrier 3
+              - !barrier 2
             - input: !chunk |-
                 +----+---+----+-----+----+
                 |  - | 6 | p2 | 203 | 23 |
@@ -346,14 +355,14 @@ async fn test_over_window_lag_lead_with_updates() {
                 | 3 | p1 | 100 | 13 |    | 18 |
                 | 5 | p1 | 105 | 18 | 13 |    |
                 +---+----+-----+----+----+----+
-            - input: !barrier 4
+            - input: !barrier 3
               output:
-              - !barrier 4
+              - !barrier 3
             - input: recovery
               output: []
-            - input: !barrier 5
+            - input: !barrier 3
               output:
-              - !barrier 5
+              - !barrier 3
             - input: !chunk |-
                 +---+----+----+-----+----+
                 | + | 10 | p3 | 300 | 30 |
@@ -371,9 +380,9 @@ async fn test_over_window_lag_lead_with_updates() {
                 | 5  | p1 | 105 | 18 | 13 |    |
                 | 10 | p3 | 300 | 30 |    |    |
                 +----+----+-----+----+----+----+
-            - input: !barrier 6
+            - input: !barrier 4
               output:
-              - !barrier 6
+              - !barrier 4
         "#]],
         snapshot_options(),
     )
@@ -390,9 +399,10 @@ async fn test_over_window_sum() {
         //   rows between 1 preceding and 2 following exclude current row
         // )
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::Sum),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::Sum.into()),
             return_type: DataType::Int64,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows_with_exclusion(
                 FrameBound::Preceding(1),
                 FrameBound::Following(2),
@@ -419,19 +429,19 @@ async fn test_over_window_sum() {
             + 6 p2 203 23
         - !barrier 2
         - recovery
-        - !barrier 3
+        - !barrier 2
         - !chunk |2
               I T  I   i
             - 6 p2 203 23
            U- 2 p1 101 16
            U+ 2 p2 101 16 // a partition-change update
-        - !barrier 4
+        - !barrier 3
         - recovery
-        - !barrier 5
+        - !barrier 3
         - !chunk |2
               I  T  I   i
             + 10 p3 300 30
-        - !barrier 6
+        - !barrier 4
         "###,
         expect![[r#"
             - input: !barrier 1
@@ -494,9 +504,9 @@ async fn test_over_window_sum() {
               - !barrier 2
             - input: recovery
               output: []
-            - input: !barrier 3
+            - input: !barrier 2
               output:
-              - !barrier 3
+              - !barrier 2
             - input: !chunk |-
                 +----+---+----+-----+----+
                 |  - | 6 | p2 | 203 | 23 |
@@ -522,14 +532,14 @@ async fn test_over_window_sum() {
                 | 3 | p1 | 100 | 13 | 35 |
                 | 5 | p1 | 105 | 18 | 13 |
                 +---+----+-----+----+----+
-            - input: !barrier 4
+            - input: !barrier 3
               output:
-              - !barrier 4
+              - !barrier 3
             - input: recovery
               output: []
-            - input: !barrier 5
+            - input: !barrier 3
               output:
-              - !barrier 5
+              - !barrier 3
             - input: !chunk |-
                 +---+----+----+-----+----+
                 | + | 10 | p3 | 300 | 30 |
@@ -548,9 +558,9 @@ async fn test_over_window_sum() {
                 | 5  | p1 | 105 | 18 | 13 |
                 | 10 | p3 | 300 | 30 |    |
                 +----+----+-----+----+----+
-            - input: !barrier 6
+            - input: !barrier 4
               output:
-              - !barrier 6
+              - !barrier 4
         "#]],
         snapshot_options(),
     )

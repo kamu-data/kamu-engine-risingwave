@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,11 +15,14 @@
  *
  */
 import "bootstrap-icons/font/bootstrap-icons.css"
+import "reflect-metadata"
 import "../styles/global.css"
 
 import { ChakraProvider } from "@chakra-ui/react"
+import { loader as monacoLoader } from "@monaco-editor/react"
 import type { AppProps } from "next/app"
 import { useRouter } from "next/router"
+import { NuqsAdapter } from "nuqs/adapters/next/pages"
 import { useEffect, useState } from "react"
 import Layout from "../components/Layout"
 import SpinnerOverlay from "../components/SpinnerOverlay"
@@ -39,12 +42,19 @@ function App({ Component, pageProps }: AppProps) {
     router.events.on("routeChangeError", () => setIsLoading(false))
   }, [router.events])
 
+  useEffect(() => {
+    // Use vendored assets to get rid of fetching from CDN.
+    monacoLoader.config({ paths: { vs: "/monaco" } })
+  })
+
   return (
-    <ChakraProvider>
-      <Layout>
-        {isLoading ? <SpinnerOverlay /> : <Component {...pageProps} />}
-      </Layout>
-    </ChakraProvider>
+    <NuqsAdapter>
+      <ChakraProvider>
+        <Layout>
+          {isLoading ? <SpinnerOverlay /> : <Component {...pageProps} />}
+        </Layout>
+      </ChakraProvider>
+    </NuqsAdapter>
   )
 }
 

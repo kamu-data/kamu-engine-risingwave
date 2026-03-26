@@ -12,7 +12,6 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
  */
 
 import { useEffect, useState } from "react"
@@ -52,7 +51,11 @@ export default function useFetch<T>(
 
     const timer = setInterval(fetchData, intervalMs)
     return () => clearInterval(timer)
-  }, [toast, fetchFn, intervalMs, when])
+    // NOTE(eric): Don't put `fetchFn` in the dependency array. Otherwise, it can cause an infinite loop.
+    // This is because `fetchFn` can be recreated every render, then it will trigger a dependency change,
+    // which triggers a re-render, and so on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toast, intervalMs, when])
 
   return { response }
 }

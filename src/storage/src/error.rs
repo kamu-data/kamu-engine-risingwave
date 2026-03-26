@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,8 @@ use thiserror::Error;
 use crate::hummock::HummockError;
 use crate::mem_table::MemTableError;
 
-#[derive(Error, Debug, thiserror_ext::Box)]
-#[thiserror_ext(newtype(name = StorageError, backtrace, report_debug))]
+#[derive(Error, thiserror_ext::ReportDebug, thiserror_ext::Box)]
+#[thiserror_ext(newtype(name = StorageError, backtrace))]
 pub enum ErrorKind {
     #[error("Hummock error: {0}")]
     Hummock(

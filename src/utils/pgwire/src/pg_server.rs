@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,26 +14,28 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io;
-use std::result::Result;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use parking_lot::Mutex;
+use risingwave_common::config::HbaEntry;
+use risingwave_common::id::DatabaseId;
 use risingwave_common::types::DataType;
+use risingwave_common::util::runtime::BackgroundShutdownRuntime;
+use risingwave_common::util::tokio_util::sync::CancellationToken;
 use risingwave_sqlparser::ast::Statement;
 use serde::Deserialize;
 use thiserror_ext::AsReport;
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::error::{PsqlError, PsqlResult};
-use crate::net::{AddressRef, Listener};
+use crate::ldap_auth::LdapAuthenticator;
+use crate::net::{AddressRef, Listener, TcpKeepalive};
 use crate::pg_field_descriptor::PgFieldDescriptor;
 use crate::pg_message::TransactionStatus;
-use crate::pg_protocol::{PgProtocol, TlsConfig};
+use crate::pg_protocol::{ConnectionContext, PgByteStream, PgProtocol};
 use crate::pg_response::{PgResponse, ValuesStream};
 use crate::types::Format;
 
@@ -45,25 +47,39 @@ pub type SessionId = (ProcessId, SecretKey);
 /// The interface for a database system behind pgwire protocol.
 /// We can mock it for testing purpose.
 pub trait SessionManager: Send + Sync + 'static {
-    type Session: Session;
+    type Error: Into<BoxedError>;
+    type Session: Session<Error = Self::Error>;
+
+    /// In the process of auto schema change, we need a dummy session to access
+    /// catalog information in frontend and build a replace plan for the table.
+    fn create_dummy_session(
+        &self,
+        database_id: DatabaseId,
+    ) -> Result<Arc<Self::Session>, Self::Error>;
 
     fn connect(
         &self,
         database: &str,
         user_name: &str,
         peer_addr: AddressRef,
-    ) -> Result<Arc<Self::Session>, BoxedError>;
+    ) -> Result<Arc<Self::Session>, Self::Error>;
 
     fn cancel_queries_in_session(&self, session_id: SessionId);
 
     fn cancel_creating_jobs_in_session(&self, session_id: SessionId);
 
     fn end_session(&self, session: &Self::Session);
+
+    /// Run some cleanup tasks before the server shutdown.
+    fn shutdown(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// A psql connection. Each connection binds with a database. Switching database will need to
 /// recreate another connection.
 pub trait Session: Send + Sync {
+    type Error: Into<BoxedError>;
     type ValuesStream: ValuesStream;
     type PreparedStatement: Send + Clone + 'static;
     type Portal: Send + Clone + std::fmt::Display + 'static;
@@ -74,17 +90,18 @@ pub trait Session: Send + Sync {
         self: Arc<Self>,
         stmt: Statement,
         format: Format,
-    ) -> impl Future<Output = Result<PgResponse<Self::ValuesStream>, BoxedError>> + Send;
+    ) -> impl Future<Output = Result<PgResponse<Self::ValuesStream>, Self::Error>> + Send;
 
     fn parse(
         self: Arc<Self>,
         sql: Option<Statement>,
         params_types: Vec<Option<DataType>>,
-    ) -> Result<Self::PreparedStatement, BoxedError>;
+    ) -> impl Future<Output = Result<Self::PreparedStatement, Self::Error>> + Send;
 
-    // TODO: maybe this function should be async and return the notice more timely
-    /// try to take the current notices from the session
-    fn take_notices(self: Arc<Self>) -> Vec<String>;
+    /// Receive the next notice message to send to the client.
+    ///
+    /// This function should be cancellation-safe.
+    fn next_notice(self: &Arc<Self>) -> impl Future<Output = String> + Send;
 
     fn bind(
         self: Arc<Self>,
@@ -92,34 +109,38 @@ pub trait Session: Send + Sync {
         params: Vec<Option<Bytes>>,
         param_formats: Vec<Format>,
         result_formats: Vec<Format>,
-    ) -> Result<Self::Portal, BoxedError>;
+    ) -> Result<Self::Portal, Self::Error>;
 
     fn execute(
         self: Arc<Self>,
         portal: Self::Portal,
-    ) -> impl Future<Output = Result<PgResponse<Self::ValuesStream>, BoxedError>> + Send;
+    ) -> impl Future<Output = Result<PgResponse<Self::ValuesStream>, Self::Error>> + Send;
 
     fn describe_statement(
         self: Arc<Self>,
         prepare_statement: Self::PreparedStatement,
-    ) -> Result<(Vec<DataType>, Vec<PgFieldDescriptor>), BoxedError>;
+    ) -> Result<(Vec<DataType>, Vec<PgFieldDescriptor>), Self::Error>;
 
     fn describe_portal(
         self: Arc<Self>,
         portal: Self::Portal,
-    ) -> Result<Vec<PgFieldDescriptor>, BoxedError>;
+    ) -> Result<Vec<PgFieldDescriptor>, Self::Error>;
 
     fn user_authenticator(&self) -> &UserAuthenticator;
 
     fn id(&self) -> SessionId;
 
-    fn set_config(&self, key: &str, value: String) -> Result<(), BoxedError>;
+    fn get_config(&self, key: &str) -> Result<String, Self::Error>;
+
+    fn set_config(&self, key: &str, value: String) -> Result<String, Self::Error>;
 
     fn transaction_status(&self) -> TransactionStatus;
 
     fn init_exec_context(&self, sql: Arc<str>) -> ExecContextGuard;
 
     fn check_idle_in_transaction_timeout(&self) -> PsqlResult<()>;
+
+    fn user(&self) -> String;
 }
 
 /// Each session could run different SQLs multiple times.
@@ -159,7 +180,11 @@ pub enum UserAuthenticator {
         encrypted_password: Vec<u8>,
         salt: [u8; 4],
     },
-    OAuth(HashMap<String, String>),
+    OAuth {
+        metadata: HashMap<String, String>,
+        cluster_id: String,
+    },
+    Ldap(String, HbaEntry),
 }
 
 /// A JWK Set is a JSON object that represents a set of JWKs.
@@ -184,18 +209,33 @@ async fn validate_jwt(
     jwt: &str,
     jwks_url: &str,
     issuer: &str,
+    cluster_id: &str,
+    metadata: &HashMap<String, String>,
+) -> Result<bool, BoxedError> {
+    let jwks: Jwks = reqwest::get(jwks_url).await?.json().await?;
+    validate_jwt_with_jwks(jwt, &jwks, issuer, cluster_id, metadata)
+}
+
+fn audience_from_cluster_id(cluster_id: &str) -> String {
+    format!("urn:risingwave:cluster:{}", cluster_id)
+}
+
+fn validate_jwt_with_jwks(
+    jwt: &str,
+    jwks: &Jwks,
+    issuer: &str,
+    cluster_id: &str,
     metadata: &HashMap<String, String>,
 ) -> Result<bool, BoxedError> {
     let header = decode_header(jwt)?;
-    let jwks: Jwks = reqwest::get(jwks_url).await?.json().await?;
 
     // 1. Retrieve the kid from the header to find the right JWK in the JWK Set.
-    let kid = header.kid.ok_or("kid not found in jwt header")?;
+    let kid = header.kid.ok_or("JWT header missing 'kid' field")?;
     let jwk = jwks
         .keys
-        .into_iter()
+        .iter()
         .find(|k| k.kid == kid)
-        .ok_or("kid not found in jwks")?;
+        .ok_or(format!("No matching key found in JWKS for kid: '{}'", kid))?;
 
     // 2. Check if the algorithms are matched.
     if Algorithm::from_str(&jwk.alg)? != header.alg {
@@ -206,7 +246,8 @@ async fn validate_jwt(
     let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)?;
     let mut validation = Validation::new(header.alg);
     validation.set_issuer(&[issuer]);
-    validation.set_required_spec_claims(&["exp", "iss"]);
+    validation.set_audience(&[audience_from_cluster_id(cluster_id)]); // JWT 'aud' claim must match cluster_id
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     let token_data = decode::<HashMap<String, serde_json::Value>>(jwt, &decoding_key, &validation)?;
 
     // 4. Check if the metadata in the token matches.
@@ -226,7 +267,10 @@ impl UserAuthenticator {
             UserAuthenticator::Md5WithSalt {
                 encrypted_password, ..
             } => encrypted_password == password,
-            UserAuthenticator::OAuth(metadata) => {
+            UserAuthenticator::OAuth {
+                metadata,
+                cluster_id,
+            } => {
                 let mut metadata = metadata.clone();
                 let jwks_url = metadata.remove("jwks_url").unwrap();
                 let issuer = metadata.remove("issuer").unwrap();
@@ -234,10 +278,17 @@ impl UserAuthenticator {
                     &String::from_utf8_lossy(password),
                     &jwks_url,
                     &issuer,
+                    cluster_id,
                     &metadata,
                 )
                 .await
                 .map_err(PsqlError::StartupError)?
+            }
+            UserAuthenticator::Ldap(user_name, hba_entry) => {
+                let ldap_auth = LdapAuthenticator::new(hba_entry)?;
+                // Convert password to string, defaulting to empty if not valid UTF-8
+                let password_str = String::from_utf8_lossy(password).into_owned();
+                ldap_auth.authenticate(user_name, &password_str).await?
             }
         };
         if !success {
@@ -248,80 +299,102 @@ impl UserAuthenticator {
 }
 
 /// Binds a Tcp or Unix listener at `addr`. Spawn a coroutine to serve every new connection.
+///
+/// Returns when the `shutdown` token is triggered.
 pub async fn pg_serve(
     addr: &str,
+    tcp_keepalive: TcpKeepalive,
     session_mgr: Arc<impl SessionManager>,
-    tls_config: Option<TlsConfig>,
-) -> io::Result<()> {
+    context: ConnectionContext,
+    shutdown: CancellationToken,
+) -> Result<(), BoxedError> {
     let listener = Listener::bind(addr).await?;
     tracing::info!(addr, "server started");
 
-    loop {
-        let conn_ret = listener.accept().await;
-        match conn_ret {
-            Ok((stream, peer_addr)) => {
-                tracing::info!(%peer_addr, "accept connection");
-                tokio::spawn(handle_connection(
-                    stream,
-                    session_mgr.clone(),
-                    tls_config.clone(),
-                    Arc::new(peer_addr),
-                ));
-            }
+    let acceptor_runtime = BackgroundShutdownRuntime::from({
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(1);
+        builder
+            .thread_name("rw-acceptor")
+            .enable_all()
+            .build()
+            .unwrap()
+    });
 
-            Err(e) => {
-                tracing::error!(error = %e.as_report(), "failed to accept connection",);
+    #[cfg(not(madsim))]
+    let worker_runtime = tokio::runtime::Handle::current();
+    #[cfg(madsim)]
+    let worker_runtime = tokio::runtime::Builder::new_multi_thread().build().unwrap();
+    let session_mgr_clone = session_mgr.clone();
+    let f = async move {
+        loop {
+            let conn_ret = listener.accept(&tcp_keepalive).await;
+            match conn_ret {
+                Ok((stream, peer_addr)) => {
+                    tracing::info!(%peer_addr, "accept connection");
+                    worker_runtime.spawn(handle_connection(
+                        stream,
+                        session_mgr_clone.clone(),
+                        Arc::new(peer_addr),
+                        context.clone(),
+                    ));
+                }
+
+                Err(e) => {
+                    tracing::error!(error = %e.as_report(), "failed to accept connection",);
+                }
             }
         }
-    }
+    };
+    acceptor_runtime.spawn(f);
+
+    // Wait for the shutdown signal.
+    shutdown.cancelled().await;
+
+    // Stop accepting new connections.
+    drop(acceptor_runtime);
+    // Shutdown session manager, typically close all existing sessions.
+    session_mgr.shutdown().await;
+
+    Ok(())
 }
 
 pub async fn handle_connection<S, SM>(
     stream: S,
     session_mgr: Arc<SM>,
-    tls_config: Option<TlsConfig>,
     peer_addr: AddressRef,
+    context: ConnectionContext,
 ) where
-    S: AsyncWrite + AsyncRead + Unpin,
+    S: PgByteStream,
     SM: SessionManager,
 {
-    let mut pg_proto = PgProtocol::new(stream, session_mgr, tls_config, peer_addr);
-    loop {
-        let msg = match pg_proto.read_message().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::error!(error = %e.as_report(), "error when reading message");
-                break;
-            }
-        };
-        tracing::trace!("Received message: {:?}", msg);
-        let ret = pg_proto.process(msg).await;
-        if ret {
-            break;
-        }
-    }
+    PgProtocol::new(stream, session_mgr, peer_addr, context)
+        .run()
+        .await;
 }
-
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
     use std::sync::Arc;
     use std::time::Instant;
 
     use bytes::Bytes;
-    use futures::stream::BoxStream;
     use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use risingwave_common::id::DatabaseId;
     use risingwave_common::types::DataType;
+    use risingwave_common::util::tokio_util::sync::CancellationToken;
     use risingwave_sqlparser::ast::Statement;
     use tokio_postgres::NoTls;
 
     use crate::error::PsqlResult;
+    use crate::memory_manager::MessageMemoryManager;
     use crate::pg_field_descriptor::PgFieldDescriptor;
     use crate::pg_message::TransactionStatus;
+    use crate::pg_protocol::ConnectionContext;
     use crate::pg_response::{PgResponse, RowSetResult, StatementType};
     use crate::pg_server::{
-        pg_serve, BoxedError, ExecContext, ExecContextGuard, Session, SessionId, SessionManager,
-        UserAuthenticator,
+        BoxedError, ExecContext, ExecContextGuard, Session, SessionId, SessionManager,
+        UserAuthenticator, pg_serve,
     };
     use crate::types;
     use crate::types::Row;
@@ -330,14 +403,22 @@ mod tests {
     struct MockSession {}
 
     impl SessionManager for MockSessionManager {
+        type Error = BoxedError;
         type Session = MockSession;
+
+        fn create_dummy_session(
+            &self,
+            _database_id: DatabaseId,
+        ) -> Result<Arc<Self::Session>, Self::Error> {
+            unimplemented!()
+        }
 
         fn connect(
             &self,
             _database: &str,
             _user_name: &str,
             _peer_addr: crate::net::AddressRef,
-        ) -> Result<Arc<Self::Session>, Box<dyn Error + Send + Sync>> {
+        ) -> Result<Arc<Self::Session>, Self::Error> {
             Ok(Arc::new(MockSession {}))
         }
 
@@ -353,6 +434,7 @@ mod tests {
     }
 
     impl Session for MockSession {
+        type Error = BoxedError;
         type Portal = String;
         type PreparedStatement = String;
         type ValuesStream = BoxStream<'static, RowSetResult>;
@@ -361,7 +443,7 @@ mod tests {
             self: Arc<Self>,
             _stmt: Statement,
             _format: types::Format,
-        ) -> Result<PgResponse<BoxStream<'static, RowSetResult>>, BoxedError> {
+        ) -> Result<PgResponse<BoxStream<'static, RowSetResult>>, Self::Error> {
             Ok(PgResponse::builder(StatementType::SELECT)
                 .values(
                     futures::stream::iter(vec![Ok(vec![Row::new(vec![Some(Bytes::new())])])])
@@ -369,18 +451,18 @@ mod tests {
                     vec![
                         // 1043 is the oid of varchar type.
                         // -1 is the type len of varchar type.
-                        PgFieldDescriptor::new("".to_string(), 1043, -1);
+                        PgFieldDescriptor::new("".to_owned(), 1043, -1);
                         1
                     ],
                 )
                 .into())
         }
 
-        fn parse(
+        async fn parse(
             self: Arc<Self>,
             _sql: Option<Statement>,
             _params_types: Vec<Option<DataType>>,
-        ) -> Result<String, BoxedError> {
+        ) -> Result<String, Self::Error> {
             Ok(String::new())
         }
 
@@ -390,14 +472,14 @@ mod tests {
             _params: Vec<Option<Bytes>>,
             _param_formats: Vec<types::Format>,
             _result_formats: Vec<types::Format>,
-        ) -> Result<String, BoxedError> {
+        ) -> Result<String, Self::Error> {
             Ok(String::new())
         }
 
         async fn execute(
             self: Arc<Self>,
             _portal: String,
-        ) -> Result<PgResponse<BoxStream<'static, RowSetResult>>, BoxedError> {
+        ) -> Result<PgResponse<BoxStream<'static, RowSetResult>>, Self::Error> {
             Ok(PgResponse::builder(StatementType::SELECT)
                 .values(
                     futures::stream::iter(vec![Ok(vec![Row::new(vec![Some(Bytes::new())])])])
@@ -405,7 +487,7 @@ mod tests {
                     vec![
                     // 1043 is the oid of varchar type.
                     // -1 is the type len of varchar type.
-                    PgFieldDescriptor::new("".to_string(), 1043, -1);
+                    PgFieldDescriptor::new("".to_owned(), 1043, -1);
                     1
                 ],
                 )
@@ -415,18 +497,18 @@ mod tests {
         fn describe_statement(
             self: Arc<Self>,
             _statement: String,
-        ) -> Result<(Vec<DataType>, Vec<PgFieldDescriptor>), BoxedError> {
+        ) -> Result<(Vec<DataType>, Vec<PgFieldDescriptor>), Self::Error> {
             Ok((
                 vec![],
-                vec![PgFieldDescriptor::new("".to_string(), 1043, -1)],
+                vec![PgFieldDescriptor::new("".to_owned(), 1043, -1)],
             ))
         }
 
         fn describe_portal(
             self: Arc<Self>,
             _portal: String,
-        ) -> Result<Vec<PgFieldDescriptor>, BoxedError> {
-            Ok(vec![PgFieldDescriptor::new("".to_string(), 1043, -1)])
+        ) -> Result<Vec<PgFieldDescriptor>, Self::Error> {
+            Ok(vec![PgFieldDescriptor::new("".to_owned(), 1043, -1)])
         }
 
         fn user_authenticator(&self) -> &UserAuthenticator {
@@ -437,12 +519,19 @@ mod tests {
             (0, 0)
         }
 
-        fn set_config(&self, _key: &str, _value: String) -> Result<(), BoxedError> {
-            Ok(())
+        fn get_config(&self, key: &str) -> Result<String, Self::Error> {
+            match key {
+                "timezone" => Ok("UTC".to_owned()),
+                _ => Err(format!("Unknown config key: {key}").into()),
+            }
         }
 
-        fn take_notices(self: Arc<Self>) -> Vec<String> {
-            vec![]
+        fn set_config(&self, _key: &str, _value: String) -> Result<String, Self::Error> {
+            Ok("".to_owned())
+        }
+
+        async fn next_notice(self: &Arc<Self>) -> String {
+            std::future::pending().await
         }
 
         fn transaction_status(&self) -> TransactionStatus {
@@ -461,14 +550,32 @@ mod tests {
         fn check_idle_in_transaction_timeout(&self) -> PsqlResult<()> {
             Ok(())
         }
+
+        fn user(&self) -> String {
+            "mock".to_owned()
+        }
     }
 
     async fn do_test_query(bind_addr: impl Into<String>, pg_config: impl Into<String>) {
         let bind_addr = bind_addr.into();
         let pg_config = pg_config.into();
 
-        let session_mgr = Arc::new(MockSessionManager {});
-        tokio::spawn(async move { pg_serve(&bind_addr, session_mgr, None).await });
+        let session_mgr = MockSessionManager {};
+        tokio::spawn(async move {
+            pg_serve(
+                &bind_addr,
+                socket2::TcpKeepalive::new(),
+                Arc::new(session_mgr),
+                ConnectionContext {
+                    tls_config: None,
+                    redact_sql_option_keywords: None,
+                    message_memory_manager: MessageMemoryManager::new(u64::MAX, u64::MAX, u64::MAX)
+                        .into(),
+                },
+                CancellationToken::new(), // dummy
+            )
+            .await
+        });
         // wait for server to start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -514,5 +621,347 @@ mod tests {
             format!("host={} port={}", dir.path().to_str().unwrap(), port),
         )
         .await;
+    }
+
+    mod jwt_validation_tests {
+        use std::collections::HashMap;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use base64::Engine;
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        use rsa::traits::PublicKeyParts;
+        use rsa::{RsaPrivateKey, RsaPublicKey};
+        use serde_json::json;
+
+        use crate::pg_server::{Jwk, Jwks, validate_jwt_with_jwks};
+
+        fn create_test_rsa_keys() -> (RsaPrivateKey, RsaPublicKey) {
+            let mut rng = rand::thread_rng();
+            let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("failed to generate a key");
+            let public_key = RsaPublicKey::from(&private_key);
+            (private_key, public_key)
+        }
+
+        fn create_test_jwks(public_key: &RsaPublicKey, kid: &str, alg: &str) -> Jwks {
+            let n = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(public_key.n().to_bytes_be());
+            let e = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(public_key.e().to_bytes_be());
+
+            Jwks {
+                keys: vec![Jwk {
+                    kid: kid.to_owned(),
+                    alg: alg.to_owned(),
+                    n,
+                    e,
+                }],
+            }
+        }
+
+        fn create_jwt_token(
+            private_key: &RsaPrivateKey,
+            kid: &str,
+            algorithm: Algorithm,
+            issuer: &str,
+            audience: Option<&str>,
+            exp: u64,
+            additional_claims: HashMap<String, serde_json::Value>,
+        ) -> String {
+            let mut header = Header::new(algorithm);
+            header.kid = Some(kid.to_owned());
+
+            let mut claims = json!({
+                "iss": issuer,
+                "exp": exp,
+            });
+
+            if let Some(aud) = audience {
+                claims["aud"] = json!(aud);
+            }
+
+            for (key, value) in additional_claims {
+                claims[key] = value;
+            }
+
+            let encoding_key = EncodingKey::from_rsa_pem(
+                private_key
+                    .to_pkcs1_pem(rsa::pkcs1::LineEnding::LF)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+
+            jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap()
+        }
+
+        fn get_future_timestamp() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600 // 1 hour from now
+        }
+
+        fn get_past_timestamp() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 3600 // 1 hour ago
+        }
+
+        #[test]
+        fn test_jwt_with_invalid_audience() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let metadata = HashMap::new();
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                Some("urn:risingwave:cluster:wrong-cluster-id"),
+                get_future_timestamp(),
+                HashMap::new(),
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("InvalidAudience"));
+        }
+
+        #[test]
+        fn test_jwt_with_missing_audience() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let metadata = HashMap::new();
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                None, // No audience claim
+                get_future_timestamp(),
+                HashMap::new(),
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("Missing required claim: aud"));
+        }
+
+        #[test]
+        fn test_jwt_with_invalid_issuer() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let metadata = HashMap::new();
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://wrong-issuer.com",
+                Some("urn:risingwave:cluster:test-cluster-id"),
+                get_future_timestamp(),
+                HashMap::new(),
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("InvalidIssuer"));
+        }
+
+        #[test]
+        fn test_jwt_with_kid_not_found_in_jwks() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "different-kid", "RS256");
+
+            let metadata = HashMap::new();
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "missing-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                Some("urn:risingwave:cluster:test-cluster-id"),
+                get_future_timestamp(),
+                HashMap::new(),
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("No matching key found in JWKS for kid: 'missing-kid'")
+            );
+        }
+
+        #[test]
+        fn test_jwt_with_expired_token() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let metadata = HashMap::new();
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                Some("urn:risingwave:cluster:test-cluster-id"),
+                get_past_timestamp(), // Expired token
+                HashMap::new(),
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("ExpiredSignature"));
+        }
+
+        #[test]
+        fn test_jwt_with_invalid_signature() {
+            let (_, public_key) = create_test_rsa_keys();
+            let (wrong_private_key, _) = create_test_rsa_keys(); // Different key pair
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let metadata = HashMap::new();
+
+            // Sign with wrong private key
+            let jwt = create_jwt_token(
+                &wrong_private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                Some("urn:risingwave:cluster:test-cluster-id"),
+                get_future_timestamp(),
+                HashMap::new(),
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("InvalidSignature"));
+        }
+
+        #[test]
+        fn test_metadata_validation_success() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let mut metadata = HashMap::new();
+            metadata.insert("role".to_owned(), "admin".to_owned());
+            metadata.insert("department".to_owned(), "security".to_owned());
+
+            let mut claims = HashMap::new();
+            claims.insert("role".to_owned(), json!("admin"));
+            claims.insert("department".to_owned(), json!("security"));
+            claims.insert("extra_claim".to_owned(), json!("ignored")); // Extra claims are fine
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                Some("urn:risingwave:cluster:test-cluster-id"),
+                get_future_timestamp(),
+                claims,
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            assert!(result.unwrap());
+        }
+
+        #[test]
+        fn test_metadata_validation_failure() {
+            let (private_key, public_key) = create_test_rsa_keys();
+            let jwks = create_test_jwks(&public_key, "test-kid", "RS256");
+
+            let mut metadata = HashMap::new();
+            metadata.insert("role".to_owned(), "admin".to_owned());
+            metadata.insert("department".to_owned(), "security".to_owned());
+
+            let mut claims = HashMap::new();
+            claims.insert("role".to_owned(), json!("user")); // Wrong role
+            claims.insert("department".to_owned(), json!("security"));
+
+            let jwt = create_jwt_token(
+                &private_key,
+                "test-kid",
+                Algorithm::RS256,
+                "https://test-issuer.com",
+                Some("urn:risingwave:cluster:test-cluster-id"),
+                get_future_timestamp(),
+                claims,
+            );
+
+            let result = validate_jwt_with_jwks(
+                &jwt,
+                &jwks,
+                "https://test-issuer.com",
+                "test-cluster-id",
+                &metadata,
+            );
+
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "metadata in jwt does not match with metadata declared with user"
+            );
+        }
     }
 }

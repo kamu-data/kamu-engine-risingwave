@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,24 +13,24 @@
 // limitations under the License.
 
 use std::fmt::Debug;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::{BufMut, BytesMut};
 use num_traits::{
     CheckedAdd, CheckedDiv, CheckedMul, CheckedNeg, CheckedRem, CheckedSub, Num, One, Zero,
 };
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{FromSql, IsNull, ToSql, Type, accepts, to_sql_checked};
 use risingwave_common_estimate_size::ZeroHeapSize;
 use rust_decimal::prelude::FromStr;
 use rust_decimal::{Decimal as RustDecimal, Error, MathematicalOps as _, RoundingStrategy};
 
-use super::to_binary::ToBinary;
-use super::to_text::ToText;
 use super::DataType;
+use super::to_text::ToText;
 use crate::array::ArrayResult;
-use crate::types::ordered_float::OrderedFloat;
 use crate::types::Decimal::Normalized;
+use crate::types::ordered_float::OrderedFloat;
 
 #[derive(Debug, Copy, parse_display::Display, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum Decimal {
@@ -89,19 +89,6 @@ impl Decimal {
     }
 }
 
-impl ToBinary for Decimal {
-    fn to_binary_with_type(&self, ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        match ty {
-            DataType::Decimal => {
-                let mut output = BytesMut::new();
-                self.to_sql(&Type::NUMERIC, &mut output).unwrap();
-                Ok(Some(output.freeze()))
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 impl ToSql for Decimal {
     accepts!(NUMERIC);
 
@@ -142,6 +129,28 @@ impl ToSql for Decimal {
             }
         }
         Ok(IsNull::No)
+    }
+}
+
+impl<'a> FromSql<'a> for Decimal {
+    fn from_sql(
+        ty: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + 'static + Sync + Send>> {
+        let mut rdr = Cursor::new(raw);
+        let _n_digits = rdr.read_u16::<BigEndian>()?;
+        let _weight = rdr.read_i16::<BigEndian>()?;
+        let sign = rdr.read_u16::<BigEndian>()?;
+        match sign {
+            0xC000 => Ok(Self::NaN),
+            0xD000 => Ok(Self::PositiveInf),
+            0xF000 => Ok(Self::NegativeInf),
+            _ => RustDecimal::from_sql(ty, raw).map(Self::Normalized),
+        }
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::NUMERIC)
     }
 }
 
@@ -432,6 +441,7 @@ impl Sub for Decimal {
 }
 
 impl Decimal {
+    const MAX_I128_REPR: i128 = 0x0000_0000_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
     pub const MAX_PRECISION: u8 = 28;
 
     pub fn scale(&self) -> Option<i32> {
@@ -461,7 +471,7 @@ impl Decimal {
     /// Round to the left of the decimal point, for example `31.5` -> `30`.
     #[must_use]
     pub fn round_left_ties_away(&self, left: u32) -> Option<Self> {
-        let Self::Normalized(mut d) = self else {
+        let &Self::Normalized(mut d) = self else {
             return Some(*self);
         };
 
@@ -538,6 +548,28 @@ impl Decimal {
 
     pub fn from_i128_with_scale(num: i128, scale: u32) -> Self {
         Decimal::Normalized(RustDecimal::from_i128_with_scale(num, scale))
+    }
+
+    /// Truncate the given `num` and `scale` to fit into `Decimal`, return `None` if it cannot be
+    /// represented even after truncation.
+    pub fn truncated_i128_and_scale(mut num: i128, mut scale: u32) -> Option<Self> {
+        if num.abs() > Self::MAX_I128_REPR {
+            let digits = num.abs().ilog10() + 1;
+            let diff_scale = digits.saturating_sub(Self::MAX_PRECISION as u32);
+            if scale < diff_scale {
+                return None;
+            }
+            num /= 10i128.pow(diff_scale);
+            scale -= diff_scale;
+        }
+        if scale > Self::MAX_PRECISION as u32 {
+            let diff_scale = scale - Self::MAX_PRECISION as u32;
+            num /= 10i128.pow(diff_scale);
+            scale = Self::MAX_PRECISION as u32;
+        }
+        Some(Decimal::Normalized(
+            RustDecimal::try_from_i128_with_scale(num, scale).ok()?,
+        ))
     }
 
     #[must_use]
@@ -745,7 +777,9 @@ impl FromStr for Decimal {
             "nan" => Ok(Decimal::NaN),
             "inf" | "+inf" | "infinity" | "+infinity" => Ok(Decimal::PositiveInf),
             "-inf" | "-infinity" => Ok(Decimal::NegativeInf),
-            s => RustDecimal::from_str(s).map(Decimal::Normalized),
+            s => RustDecimal::from_str(s)
+                .or_else(|_| RustDecimal::from_scientific(s))
+                .map(Decimal::Normalized),
         }
     }
 }

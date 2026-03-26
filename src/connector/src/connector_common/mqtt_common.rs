@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use phf::{Set, phf_set};
+use risingwave_common::id::ActorId;
+use rumqttc::tokio_rustls::rustls;
 use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::mqttbytes::v5::ConnectProperties;
 use rumqttc::v5::{AsyncClient, EventLoop, MqttOptions};
-use serde_derive::Deserialize;
-use serde_with::{serde_as, DisplayFromStr};
+use serde::Deserialize;
+use serde_with::{DisplayFromStr, serde_as};
 use strum_macros::{Display, EnumString};
 use with_options::WithOptions;
 
-use crate::connector_common::common::{load_certs, load_private_key};
+use super::common::{load_certs, load_private_key};
 use crate::deserialize_bool_from_string;
+use crate::enforce_secret::EnforceSecret;
 use crate::error::ConnectorResult;
 
 #[derive(Debug, Clone, PartialEq, Display, Deserialize, EnumString)]
@@ -35,17 +40,14 @@ pub enum QualityOfService {
 #[serde_as]
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct MqttCommon {
-    /// The url of the broker to connect to. e.g. tcp://localhost.
+    /// The url of the broker to connect to. e.g. <tcp://localhost>.
     /// Must be prefixed with one of either `tcp://`, `mqtt://`, `ssl://`,`mqtts://`,
     /// to denote the protocol for establishing a connection with the broker.
     /// `mqtts://`, `ssl://` will use the native certificates if no ca is specified
     pub url: String,
 
-    /// The topic name to subscribe or publish to. When subscribing, it can be a wildcard topic. e.g /topic/#
-    pub topic: String,
-
-    /// The quality of service to use when publishing messages. Defaults to at_most_once.
-    /// Could be at_most_once, at_least_once or exactly_once
+    /// The quality of service to use when publishing messages. Defaults to `at_most_once`.
+    /// Could be `at_most_once`, `at_least_once` or `exactly_once`
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub qos: Option<QualityOfService>,
 
@@ -73,8 +75,12 @@ pub struct MqttCommon {
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub inflight_messages: Option<usize>,
 
+    /// The max size of messages received by the MQTT client
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub max_packet_size: Option<u32>,
+
     /// Path to CA certificate file for verifying the broker's key.
-    #[serde(rename = "tls.client_key")]
+    #[serde(rename = "tls.ca")]
     pub ca: Option<String>,
     /// Path to client's certificate file (PEM). Required for client authentication.
     /// Can be a file path under fs:// or a string with the certificate content.
@@ -87,11 +93,19 @@ pub struct MqttCommon {
     pub client_key: Option<String>,
 }
 
+impl EnforceSecret for MqttCommon {
+    const ENFORCE_SECRET_PROPERTIES: Set<&'static str> = phf_set! {
+        "tls.client_cert",
+        "tls.client_key",
+        "password",
+    };
+}
+
 impl MqttCommon {
     pub(crate) fn build_client(
         &self,
-        actor_id: u32,
-        id: u64,
+        actor_id: ActorId,
+        id: u32,
     ) -> ConnectorResult<(AsyncClient, EventLoop)> {
         let client_id = format!(
             "{}_{}_{}",
@@ -112,6 +126,10 @@ impl MqttCommon {
         options.set_keep_alive(std::time::Duration::from_secs(10));
 
         options.set_clean_start(self.clean_start);
+
+        let mut connect_properties = ConnectProperties::new();
+        connect_properties.max_packet_size = self.max_packet_size;
+        options.set_connect_properties(connect_properties);
 
         if ssl {
             let tls_config = self.get_tls_config()?;
@@ -141,26 +159,22 @@ impl MqttCommon {
             .unwrap_or(QoS::AtMostOnce)
     }
 
-    fn get_tls_config(&self) -> ConnectorResult<tokio_rustls::rustls::ClientConfig> {
-        let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+    fn get_tls_config(&self) -> ConnectorResult<rustls::ClientConfig> {
+        let mut root_cert_store = rustls::RootCertStore::empty();
         if let Some(ca) = &self.ca {
             let certificates = load_certs(ca)?;
             for cert in certificates {
-                root_cert_store.add(&cert).unwrap();
+                root_cert_store.add(cert).unwrap();
             }
         } else {
             for cert in
                 rustls_native_certs::load_native_certs().expect("could not load platform certs")
             {
-                root_cert_store
-                    .add(&tokio_rustls::rustls::Certificate(cert.to_vec()))
-                    .unwrap();
+                root_cert_store.add(cert).unwrap();
             }
         }
 
-        let builder = tokio_rustls::rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(root_cert_store);
+        let builder = rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
 
         let tls_config = if let (Some(client_cert), Some(client_key)) =
             (self.client_cert.as_ref(), self.client_key.as_ref())

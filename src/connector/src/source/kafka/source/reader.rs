@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::mem::swap;
 use std::time::Duration;
 
@@ -21,26 +21,30 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures_async_stream::try_stream;
-use rdkafka::config::RDKafkaLogLevel;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList};
+use risingwave_common::metrics::LabelGuardedIntGauge;
 use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 
+use crate::connector_common::read_kafka_log_level;
 use crate::error::ConnectorResult as Result;
 use crate::parser::ParserConfig;
 use crate::source::base::SourceMessage;
 use crate::source::kafka::{
-    KafkaProperties, KafkaSplit, PrivateLinkConsumerContext, KAFKA_ISOLATION_LEVEL,
+    KAFKA_ISOLATION_LEVEL, KafkaContextCommon, KafkaProperties, KafkaSplit, RwConsumerContext,
 };
 use crate::source::{
-    into_chunk_stream, BoxChunkSourceStream, Column, CommonSplitReader, SourceContextRef, SplitId,
-    SplitMetaData, SplitReader,
+    BackfillInfo, BoxSourceChunkStream, Column, SourceContextRef, SplitId, SplitImpl,
+    SplitMetaData, SplitReader, into_chunk_stream,
 };
 
 pub struct KafkaSplitReader {
-    consumer: StreamConsumer<PrivateLinkConsumerContext>,
+    consumer: StreamConsumer<RwConsumerContext>,
     offsets: HashMap<SplitId, (Option<i64>, Option<i64>)>,
+    backfill_info: HashMap<SplitId, BackfillInfo>,
+    splits: Vec<KafkaSplit>,
+    sync_call_timeout: Duration,
     bytes_per_second: usize,
     max_num_messages: usize,
     parser_config: ParserConfig,
@@ -61,29 +65,21 @@ impl SplitReader for KafkaSplitReader {
     ) -> Result<Self> {
         let mut config = ClientConfig::new();
 
-        let bootstrap_servers = &properties.common.brokers;
+        let bootstrap_servers = &properties.connection.brokers;
         let broker_rewrite_map = properties.privatelink_common.broker_rewrite_map.clone();
 
         // disable partition eof
         config.set("enable.partition.eof", "false");
-        // change to `RdKafkaPropertiesConsumer::enable_auto_commit` to enable auto commit
-        // config.set("enable.auto.commit", "false");
         config.set("auto.offset.reset", "smallest");
         config.set("isolation.level", KAFKA_ISOLATION_LEVEL);
         config.set("bootstrap.servers", bootstrap_servers);
 
-        properties.common.set_security_properties(&mut config);
+        properties.connection.set_security_properties(&mut config);
         properties.set_client(&mut config);
 
-        config.set(
-            "group.id",
-            format!(
-                "rw-consumer-{}-{}",
-                source_ctx.fragment_id, source_ctx.actor_id
-            ),
-        );
+        config.set("group.id", properties.group_id(source_ctx.fragment_id));
 
-        let client_ctx = PrivateLinkConsumerContext::new(
+        let ctx_common = KafkaContextCommon::new(
             broker_rewrite_map,
             Some(format!(
                 "fragment-{}-source-{}-actor-{}",
@@ -92,9 +88,17 @@ impl SplitReader for KafkaSplitReader {
             // thread consumer will keep polling in the background, we don't need to call `poll`
             // explicitly
             Some(source_ctx.metrics.rdkafka_native_metric.clone()),
-        )?;
-        let consumer: StreamConsumer<PrivateLinkConsumerContext> = config
-            .set_log_level(RDKafkaLogLevel::Info)
+            properties.aws_auth_props,
+            properties.connection.is_aws_msk_iam(),
+        )
+        .await?;
+
+        let client_ctx = RwConsumerContext::new(ctx_common);
+
+        if let Some(log_level) = read_kafka_log_level() {
+            config.set_log_level(log_level);
+        }
+        let consumer: StreamConsumer<RwConsumerContext> = config
             .create_with_context(client_ctx)
             .await
             .context("failed to create kafka consumer")?;
@@ -102,8 +106,8 @@ impl SplitReader for KafkaSplitReader {
         let mut tpl = TopicPartitionList::with_capacity(splits.len());
 
         let mut offsets = HashMap::new();
-
-        for split in splits {
+        let mut backfill_info = HashMap::new();
+        for split in splits.clone() {
             offsets.insert(split.id(), (split.start_offset, split.stop_offset));
 
             if let Some(offset) = split.start_offset {
@@ -115,7 +119,37 @@ impl SplitReader for KafkaSplitReader {
             } else {
                 tpl.add_partition(split.topic.as_str(), split.partition);
             }
+
+            let (low, high) = consumer
+                .fetch_watermarks(
+                    split.topic.as_str(),
+                    split.partition,
+                    properties.common.sync_call_timeout,
+                )
+                .await?;
+            tracing::info!("fetch kafka watermarks: low: {low}, high: {high}, split: {split:?}");
+            // note: low is inclusive, high is exclusive, start_offset is exclusive
+            if low == high || split.start_offset.is_some_and(|offset| offset + 1 >= high) {
+                backfill_info.insert(split.id(), BackfillInfo::NoDataToBackfill);
+            } else {
+                debug_assert!(high > 0);
+                backfill_info.insert(
+                    split.id(),
+                    BackfillInfo::HasDataToBackfill {
+                        latest_offset: (high - 1).to_string(),
+                    },
+                );
+            }
         }
+        tracing::info!(
+            topic = properties.common.topic,
+            source_name = source_ctx.source_name,
+            fragment_id = %source_ctx.fragment_id,
+            source_id = %source_ctx.source_id,
+            actor_id = %source_ctx.actor_id,
+            "backfill_info: {:?}",
+            backfill_info
+        );
 
         consumer.assign(&tpl)?;
 
@@ -137,36 +171,50 @@ impl SplitReader for KafkaSplitReader {
         Ok(Self {
             consumer,
             offsets,
+            splits,
+            backfill_info,
             bytes_per_second,
+            sync_call_timeout: properties.common.sync_call_timeout,
             max_num_messages,
             parser_config,
             source_ctx,
         })
     }
 
-    fn into_stream(self) -> BoxChunkSourceStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
-        into_chunk_stream(self, parser_config, source_context)
+        into_chunk_stream(self.into_data_stream(), parser_config, source_context)
+    }
+
+    fn backfill_info(&self) -> HashMap<SplitId, BackfillInfo> {
+        self.backfill_info.clone()
+    }
+
+    async fn seek_to_latest(&mut self) -> Result<Vec<SplitImpl>> {
+        let mut latest_splits: Vec<SplitImpl> = Vec::new();
+        let mut tpl = TopicPartitionList::with_capacity(self.splits.len());
+        for mut split in self.splits.clone() {
+            // we can't get latest offset if we use Offset::End, so we just fetch watermark here.
+            let (_low, high) = self
+                .consumer
+                .fetch_watermarks(
+                    split.topic.as_str(),
+                    split.partition,
+                    self.sync_call_timeout,
+                )
+                .await?;
+            tpl.add_partition_offset(split.topic.as_str(), split.partition, Offset::Offset(high))?;
+            split.start_offset = Some(high - 1);
+            latest_splits.push(split.into());
+        }
+        // replace the previous assignment
+        self.consumer.assign(&tpl)?;
+        Ok(latest_splits)
     }
 }
 
 impl KafkaSplitReader {
-    fn report_latest_message_id(&self, split_id: &str, offset: i64) {
-        self.source_ctx
-            .metrics
-            .latest_message_id
-            .with_label_values(&[
-                // source name is not available here
-                &self.source_ctx.source_id.to_string(),
-                &self.source_ctx.actor_id.to_string(),
-                split_id,
-            ])
-            .set(offset);
-    }
-}
-
-impl CommonSplitReader for KafkaSplitReader {
     #[try_stream(ok = Vec<SourceMessage>, error = crate::error::ConnectorError)]
     async fn into_data_stream(self) {
         if self.offsets.values().all(|(start_offset, stop_offset)| {
@@ -202,6 +250,8 @@ impl CommonSplitReader for KafkaSplitReader {
             )
         });
 
+        let mut latest_message_id_metrics: HashMap<String, LabelGuardedIntGauge> = HashMap::new();
+
         #[for_await]
         'for_outer_loop: for msgs in self.consumer.stream().ready_chunks(max_chunk_size) {
             let msgs: Vec<_> = msgs
@@ -216,7 +266,20 @@ impl CommonSplitReader for KafkaSplitReader {
 
             for (partition, offset) in split_msg_offsets {
                 let split_id = partition.to_string();
-                self.report_latest_message_id(&split_id, offset);
+                latest_message_id_metrics
+                    .entry(split_id.clone())
+                    .or_insert_with(|| {
+                        self.source_ctx
+                            .metrics
+                            .latest_message_id
+                            .with_guarded_label_values(&[
+                                // source name is not available here
+                                &self.source_ctx.source_id.to_string(),
+                                &self.source_ctx.actor_id.to_string(),
+                                &split_id,
+                            ])
+                    })
+                    .set(offset);
             }
 
             for msg in msgs {
@@ -274,5 +337,6 @@ impl CommonSplitReader for KafkaSplitReader {
             // yield in the outer loop so that we can always guarantee that some messages are read
             // every `MAX_CHUNK_SIZE`.
         }
+        tracing::info!("kafka reader finished");
     }
 }

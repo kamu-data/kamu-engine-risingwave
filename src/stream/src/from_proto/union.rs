@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,10 @@ impl ExecutorBuilder for UnionExecutorBuilder {
         _node: &Self::Node,
         _store: impl StateStore,
     ) -> StreamResult<Executor> {
-        Ok((params.info, UnionExecutor::new(params.input)).into())
+        Ok((
+            params.info,
+            UnionExecutor::new(params.input, params.executor_stats, params.actor_context),
+        )
+            .into())
     }
 }

@@ -81,6 +81,10 @@ impl<T: Ord + EstimateSize> MemMonitoredHeap<T> {
         self.mem_ctx.add(-((old_cap * size_of::<T>()) as i64));
         ret
     }
+
+    pub fn mem_context(&self) -> &MemoryContext {
+        &self.mem_ctx
+    }
 }
 
 impl<T> Extend<T> for MemMonitoredHeap<T>
@@ -112,8 +116,8 @@ mod tests {
 
     #[test]
     fn test_heap() {
-        let gauge = LabelGuardedIntGauge::<4>::test_int_gauge();
-        let mem_ctx = MemoryContext::root(gauge.clone());
+        let gauge = LabelGuardedIntGauge::test_int_gauge::<4>();
+        let mem_ctx = MemoryContext::root(gauge.clone(), u64::MAX);
 
         let mut heap = MemMonitoredHeap::<u8>::new_with(mem_ctx);
         assert_eq!(0, gauge.get());
@@ -130,8 +134,8 @@ mod tests {
 
     #[test]
     fn test_heap_drop() {
-        let gauge = LabelGuardedIntGauge::<4>::test_int_gauge();
-        let mem_ctx = MemoryContext::root(gauge.clone());
+        let gauge = LabelGuardedIntGauge::test_int_gauge::<4>();
+        let mem_ctx = MemoryContext::root(gauge.clone(), u64::MAX);
 
         let vec = {
             let mut heap = MemMonitoredHeap::<u8>::new_with(mem_ctx);

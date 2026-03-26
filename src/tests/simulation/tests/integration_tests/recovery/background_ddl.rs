@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use risingwave_common::error::AsReport;
 use risingwave_simulation::cluster::{Cluster, Configuration, Session};
 use tokio::time::sleep;
 
 use crate::utils::{
-    kill_cn_and_meta_and_wait_recover, kill_cn_and_wait_recover, kill_random_and_wait_recover,
+    kill_cn_and_meta_and_wait_recover, kill_cn_and_wait_recover,
+    kill_cn_meta_and_wait_full_recovery, kill_random_and_wait_recover,
 };
 
 const CREATE_TABLE: &str = "CREATE TABLE t(v1 int);";
@@ -28,9 +29,10 @@ const DROP_TABLE: &str = "DROP TABLE t;";
 const SEED_TABLE_500: &str = "INSERT INTO t SELECT generate_series FROM generate_series(1, 500);";
 const SEED_TABLE_100: &str = "INSERT INTO t SELECT generate_series FROM generate_series(1, 100);";
 const SET_BACKGROUND_DDL: &str = "SET BACKGROUND_DDL=true;";
-const SET_RATE_LIMIT_2: &str = "SET STREAMING_RATE_LIMIT=2;";
-const SET_RATE_LIMIT_1: &str = "SET STREAMING_RATE_LIMIT=1;";
-const RESET_RATE_LIMIT: &str = "SET STREAMING_RATE_LIMIT=0;";
+const RESET_BACKGROUND_DDL: &str = "SET BACKGROUND_DDL=false;";
+const SET_RATE_LIMIT_2: &str = "SET BACKFILL_RATE_LIMIT=2;";
+const SET_RATE_LIMIT_1: &str = "SET BACKFILL_RATE_LIMIT=1;";
+const RESET_RATE_LIMIT: &str = "SET BACKFILL_RATE_LIMIT=DEFAULT;";
 const CREATE_MV1: &str = "CREATE MATERIALIZED VIEW mv1 as SELECT * FROM t;";
 const DROP_MV1: &str = "DROP MATERIALIZED VIEW mv1;";
 const WAIT: &str = "WAIT;";
@@ -183,24 +185,24 @@ async fn test_ddl_cancel() -> Result<()> {
 
     // Test cancel after kill cn
     kill_cn_and_wait_recover(&cluster).await;
-
     let ids = cancel_stream_jobs(&mut session).await?;
     assert_eq!(ids.len(), 1);
+    tracing::info!("tested cancel background_ddl after recovery");
 
     sleep(Duration::from_secs(2)).await;
 
     create_mv(&mut session).await?;
 
-    // Test cancel after kill meta
+    // Test cancel after kill random nodes
     kill_random_and_wait_recover(&cluster).await;
-
     let ids = cancel_stream_jobs(&mut session).await?;
     assert_eq!(ids.len(), 1);
+    tracing::info!("tested cancel background_ddl after recovery from random node kill");
 
-    // Test cancel by sigkill
-
+    // Test cancel by sigkill (only works for foreground mv)
     let mut session2 = cluster.start_session();
     tokio::spawn(async move {
+        session2.run(RESET_BACKGROUND_DDL).await.unwrap();
         session2.run(SET_RATE_LIMIT_1).await.unwrap();
         let _ = create_mv(&mut session2).await;
     });
@@ -212,9 +214,12 @@ async fn test_ddl_cancel() -> Result<()> {
             .lines()
             .find(|line| line.to_lowercase().contains("mv1"))
         {
-            let pid = line.split_whitespace().next().unwrap();
-            let pid = pid.parse::<usize>().unwrap();
-            session.run(format!("kill {};", pid)).await?;
+            tracing::info!("found mv1 process: {}", line);
+            let mut splits = line.split_whitespace();
+            let _worker_id = splits.next().unwrap();
+            let pid = splits.next().unwrap();
+            session.run(format!("kill '{}';", pid)).await?;
+            sleep(Duration::from_secs(10)).await;
             break;
         }
         sleep(Duration::from_secs(2)).await;
@@ -229,7 +234,7 @@ async fn test_ddl_cancel() -> Result<()> {
         let result = create_mv(&mut session).await;
         match result {
             Ok(_) => break,
-            Err(e) if e.to_string().contains("in creating procedure") => {
+            Err(e) if e.to_string().contains("under creation") => {
                 tracing::info!("create mv failed, retrying: {}", e);
             }
             Err(e) => {
@@ -262,12 +267,12 @@ async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
 
     session.run("CREATE TABLE fact1 (v1 int)").await?;
     session
-        .run("INSERT INTO fact1 select 1 from generate_series(1, 100000)")
+        .run("INSERT INTO fact1 select 1 from generate_series(1, 10000)")
         .await?;
 
     session.run("CREATE TABLE fact2 (v1 int)").await?;
     session
-        .run("INSERT INTO fact2 select 1 from generate_series(1, 100000)")
+        .run("INSERT INTO fact2 select 1 from generate_series(1, 10000)")
         .await?;
     session.flush().await?;
 
@@ -277,6 +282,7 @@ async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
     // Keep creating mv1, if it's not created.
     loop {
         session.run(SET_BACKGROUND_DDL).await?;
+        session.run(SET_RATE_LIMIT_2).await?;
         session.run("CREATE MATERIALIZED VIEW mv1 as select fact1.v1 from fact1 join fact2 on fact1.v1 = fact2.v1").await?;
         tracing::info!("created mv in background");
         sleep(Duration::from_secs(1)).await;
@@ -317,9 +323,9 @@ async fn test_high_barrier_latency_cancel(config: Configuration) -> Result<()> {
             .await
             .unwrap();
         tracing::info!(progress, "get progress before cancel stream job");
-        let progress = progress.replace('%', "");
+        let progress = progress.split_once("%").unwrap().0;
         let progress = progress.parse::<f64>().unwrap();
-        if progress > 0.01 {
+        if progress >= 0.01 {
             break;
         } else {
             sleep(Duration::from_micros(1)).await;
@@ -440,7 +446,7 @@ async fn test_foreground_index_cancel() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_sink_create() -> Result<()> {
+async fn test_background_sink_create() -> Result<()> {
     init_logger();
     let mut cluster = Cluster::start(Configuration::for_background_ddl()).await?;
     let mut session = cluster.start_session();
@@ -450,6 +456,7 @@ async fn test_sink_create() -> Result<()> {
 
     let mut session2 = cluster.start_session();
     tokio::spawn(async move {
+        session2.run(SET_BACKGROUND_DDL).await.unwrap();
         session2.run(SET_RATE_LIMIT_2).await.unwrap();
         session2
             .run("CREATE SINK s FROM t WITH (connector='blackhole');")
@@ -460,7 +467,7 @@ async fn test_sink_create() -> Result<()> {
     // Wait for job to start
     sleep(Duration::from_secs(2)).await;
 
-    kill_cn_and_meta_and_wait_recover(&cluster).await;
+    kill_cn_meta_and_wait_full_recovery(&mut cluster).await;
 
     // Sink job should still be present, and we can drop it.
     session.run("DROP SINK s;").await?;
@@ -500,6 +507,53 @@ async fn test_background_agg_mv_recovery() -> Result<()> {
     // it will not be dropped.
     session.run("DROP MATERIALIZED VIEW mv1;").await?;
     session.run("DROP TABLE t1;").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_background_index_creation() -> Result<()> {
+    init_logger();
+    let mut cluster = Cluster::start(Configuration::for_background_ddl()).await?;
+    let mut session = cluster.start_session();
+
+    // Create table and insert some data
+    session.run("CREATE TABLE t(v1 int, v2 int);").await?;
+    session
+        .run("INSERT INTO t SELECT generate_series, generate_series * 2 FROM generate_series(1, 100);")
+        .await?;
+    session.flush().await?;
+
+    // Enable background DDL and create index
+    session.run(SET_RATE_LIMIT_2).await?;
+    session.run(SET_BACKGROUND_DDL).await?;
+    session.run("CREATE INDEX idx_v1 ON t(v1);").await?;
+
+    // Kill CN and recover to test background index recovery
+    kill_cn_and_wait_recover(&cluster).await;
+
+    // Add more data
+    session
+        .run("INSERT INTO t SELECT generate_series, generate_series * 2 FROM generate_series(101, 200);")
+        .await?;
+    session.flush().await?;
+
+    // Wait for background index creation to complete
+    session.run(WAIT).await?;
+
+    // Verify the index was created successfully
+    let index_exists = session
+        .run("SELECT 1 FROM rw_catalog.rw_indexes WHERE name = 'idx_v1';")
+        .await?;
+    assert!(!index_exists.is_empty(), "Index should be created");
+
+    // Verify index can be used (basic functionality test)
+    let count = session.run("SELECT COUNT(*) FROM t WHERE v1 = 50;").await?;
+    assert_eq!(count.trim(), "1");
+
+    // Clean up
+    session.run("DROP INDEX idx_v1;").await?;
+    session.run("DROP TABLE t;").await?;
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,33 +14,34 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
-use std::sync::Arc;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use itertools::Itertools;
 use rdkafka::client::BrokerAddr;
-use rdkafka::consumer::ConsumerContext;
-use rdkafka::producer::{DeliveryResult, ProducerContext};
-use rdkafka::{ClientContext, Statistics};
 use risingwave_common::bail;
 use risingwave_common::util::addr::HostAddr;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_pb::catalog::connection::PrivateLinkService;
+use serde::Deserialize;
 
 use crate::connector_common::{
     AwsPrivateLinkItem, PRIVATE_LINK_BROKER_REWRITE_MAP_KEY, PRIVATE_LINK_TARGETS_KEY,
 };
 use crate::error::ConnectorResult;
-use crate::source::kafka::stats::RdKafkaStats;
 use crate::source::kafka::{KAFKA_PROPS_BROKER_KEY, KAFKA_PROPS_BROKER_KEY_ALIAS};
 
 pub const PRIVATELINK_ENDPOINT_KEY: &str = "privatelink.endpoint";
-pub const CONNECTION_NAME_KEY: &str = "connection.name";
 
 #[derive(Debug)]
-enum PrivateLinkContextRole {
+pub(super) enum PrivateLinkContextRole {
     Consumer,
+    #[expect(dead_code)]
     Producer,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrivateLinkEndpointItem {
+    host: String,
 }
 
 impl std::fmt::Display for PrivateLinkContextRole {
@@ -52,27 +53,27 @@ impl std::fmt::Display for PrivateLinkContextRole {
     }
 }
 
-struct BrokerAddrRewriter {
+pub(super) struct BrokerAddrRewriter {
+    #[expect(dead_code)]
     role: PrivateLinkContextRole,
     rewrite_map: BTreeMap<BrokerAddr, BrokerAddr>,
 }
 
 impl BrokerAddrRewriter {
-    fn rewrite_broker_addr(&self, addr: BrokerAddr) -> BrokerAddr {
-        let rewrote_addr = match self.rewrite_map.get(&addr) {
+    pub(super) fn rewrite_broker_addr(&self, addr: BrokerAddr) -> BrokerAddr {
+        match self.rewrite_map.get(&addr) {
             None => addr,
             Some(new_addr) => new_addr.clone(),
-        };
-        rewrote_addr
+        }
     }
 
     pub fn new(
         role: PrivateLinkContextRole,
-        broker_rewrite_map: Option<HashMap<String, String>>,
+        broker_rewrite_map: Option<BTreeMap<String, String>>,
     ) -> ConnectorResult<Self> {
-        tracing::info!("[{}] rewrite map {:?}", role, broker_rewrite_map);
         let rewrite_map: ConnectorResult<BTreeMap<BrokerAddr, BrokerAddr>> = broker_rewrite_map
             .map_or(Ok(BTreeMap::new()), |addr_map| {
+                tracing::info!("[{}] rewrite map {:?}", role, addr_map);
                 addr_map
                     .into_iter()
                     .map(|(old_addr, new_addr)| {
@@ -93,94 +94,6 @@ impl BrokerAddrRewriter {
         let rewrite_map = rewrite_map?;
         Ok(Self { role, rewrite_map })
     }
-}
-
-pub struct PrivateLinkConsumerContext {
-    inner: BrokerAddrRewriter,
-
-    // identifier is required when reporting metrics as a label, usually it is compose by connector
-    // format (source or sink) and corresponding id (source_id or sink_id)
-    // identifier and metrics should be set at the same time
-    identifier: Option<String>,
-    metrics: Option<Arc<RdKafkaStats>>,
-}
-
-impl PrivateLinkConsumerContext {
-    pub fn new(
-        broker_rewrite_map: Option<HashMap<String, String>>,
-        identifier: Option<String>,
-        metrics: Option<Arc<RdKafkaStats>>,
-    ) -> ConnectorResult<Self> {
-        let inner = BrokerAddrRewriter::new(PrivateLinkContextRole::Consumer, broker_rewrite_map)?;
-        Ok(Self {
-            inner,
-            identifier,
-            metrics,
-        })
-    }
-}
-
-impl ClientContext for PrivateLinkConsumerContext {
-    /// this func serves as a callback when `poll` is completed.
-    fn stats(&self, statistics: Statistics) {
-        if let Some(metrics) = &self.metrics
-            && let Some(id) = &self.identifier
-        {
-            metrics.report(id.as_str(), &statistics);
-        }
-    }
-
-    fn rewrite_broker_addr(&self, addr: BrokerAddr) -> BrokerAddr {
-        self.inner.rewrite_broker_addr(addr)
-    }
-}
-
-// required by the trait bound of BaseConsumer
-impl ConsumerContext for PrivateLinkConsumerContext {}
-
-pub struct PrivateLinkProducerContext {
-    inner: BrokerAddrRewriter,
-
-    // identifier is required when reporting metrics as a label, usually it is compose by connector
-    // format (source or sink) and corresponding id (source_id or sink_id)
-    // identifier and metrics should be set at the same time
-    identifier: Option<String>,
-    metrics: Option<Arc<RdKafkaStats>>,
-}
-
-impl PrivateLinkProducerContext {
-    pub fn new(
-        broker_rewrite_map: Option<HashMap<String, String>>,
-        identifier: Option<String>,
-        metrics: Option<Arc<RdKafkaStats>>,
-    ) -> ConnectorResult<Self> {
-        let inner = BrokerAddrRewriter::new(PrivateLinkContextRole::Producer, broker_rewrite_map)?;
-        Ok(Self {
-            inner,
-            identifier,
-            metrics,
-        })
-    }
-}
-
-impl ClientContext for PrivateLinkProducerContext {
-    fn stats(&self, statistics: Statistics) {
-        if let Some(metrics) = &self.metrics
-            && let Some(id) = &self.identifier
-        {
-            metrics.report(id.as_str(), &statistics);
-        }
-    }
-
-    fn rewrite_broker_addr(&self, addr: BrokerAddr) -> BrokerAddr {
-        self.inner.rewrite_broker_addr(addr)
-    }
-}
-
-impl ProducerContext for PrivateLinkProducerContext {
-    type DeliveryOpaque = ();
-
-    fn delivery(&self, _: &DeliveryResult<'_>, _: Self::DeliveryOpaque) {}
 }
 
 #[inline(always)]
@@ -227,10 +140,18 @@ pub fn insert_privatelink_broker_rewrite_map(
     }
 
     if let Some(endpoint) = privatelink_endpoint {
-        for (link, broker) in link_targets.iter().zip_eq_fast(broker_addrs.into_iter()) {
-            // rewrite the broker address to endpoint:port
-            broker_rewrite_map.insert(broker.to_string(), format!("{}:{}", &endpoint, link.port));
-        }
+        // new syntax: endpoint can either be a string or a json array of strings
+        // if it is a string, rewrite all broker addresses to the same endpoint
+        // eg. privatelink.endpoint='some_url' ==> broker1:9092 -> some_url:9092, broker2:9093 -> some_url:9093
+        // if it is a json array, rewrite each broker address to the corresponding endpoint
+        // eg. privatelink.endpoint = '[{"host": "aaaa"}, {"host": "bbbb"}, {"host": "cccc"}]'
+        // ==> broker1:9092 -> aaaa:9092, broker2:9093 -> bbbb:9093, broker3:9094 -> cccc:9094
+        handle_privatelink_endpoint(
+            &endpoint,
+            &mut broker_rewrite_map,
+            &link_targets,
+            &broker_addrs,
+        )?;
     } else {
         if svc.is_none() {
             bail!("Privatelink endpoint not found.");
@@ -246,7 +167,7 @@ pub fn insert_privatelink_broker_rewrite_map(
             // rewrite the broker address to the dns name w/o az
             // requires the NLB has enabled the cross-zone load balancing
             broker_rewrite_map.insert(
-                broker.to_string(),
+                broker.to_owned(),
                 format!("{}:{}", &svc.endpoint_dns_name, link.port),
             );
         }
@@ -255,6 +176,152 @@ pub fn insert_privatelink_broker_rewrite_map(
     // save private link dns names into source properties, which
     // will be extracted into KafkaProperties
     let json = serde_json::to_string(&broker_rewrite_map).map_err(|e| anyhow!(e))?;
-    with_options.insert(PRIVATE_LINK_BROKER_REWRITE_MAP_KEY.to_string(), json);
+    with_options.insert(PRIVATE_LINK_BROKER_REWRITE_MAP_KEY.to_owned(), json);
     Ok(())
+}
+
+fn handle_privatelink_endpoint(
+    endpoint: &str,
+    broker_rewrite_map: &mut HashMap<String, String>,
+    link_targets: &[AwsPrivateLinkItem],
+    broker_addrs: &[&str],
+) -> ConnectorResult<()> {
+    let endpoint = if let Ok(json) = serde_json::from_str::<serde_json::Value>(endpoint) {
+        json
+    } else {
+        serde_json::Value::String(endpoint.to_owned())
+    };
+    if matches!(endpoint, serde_json::Value::String(_)) {
+        let endpoint = endpoint.as_str().unwrap();
+        for (link, broker) in link_targets.iter().zip_eq_fast(broker_addrs.iter()) {
+            // rewrite the broker address to endpoint:port
+            broker_rewrite_map.insert(broker.to_string(), format!("{}:{}", endpoint, link.port));
+        }
+    } else if matches!(endpoint, serde_json::Value::Array(_)) {
+        let endpoint_list: Vec<PrivateLinkEndpointItem> = endpoint
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                serde_json::from_value(v.clone()).map_err(|_| {
+                    anyhow!(
+                        "expect json schema {{\"host\": \"endpoint url\"}} but got {}",
+                        v
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for ((link, broker), endpoint) in link_targets
+            .iter()
+            .zip_eq_fast(broker_addrs.iter())
+            .zip_eq_fast(endpoint_list.iter())
+        {
+            // rewrite the broker address to endpoint:port
+            broker_rewrite_map.insert(
+                broker.to_string(),
+                format!("{}:{}", endpoint.host, link.port),
+            );
+        }
+    } else {
+        bail!(
+            "expect a string or a json array for privatelink.endpoint, but got {:?}",
+            endpoint
+        )
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_privatelink_endpoint() {
+        let endpoint = "some_url"; // raw string
+        let link_targets = vec![
+            AwsPrivateLinkItem {
+                az_id: None,
+                port: 9092,
+            },
+            AwsPrivateLinkItem {
+                az_id: None,
+                port: 9093,
+            },
+        ];
+        let broker_addrs = vec!["broker1:9092", "broker2:9093"];
+        let mut broker_rewrite_map = HashMap::new();
+        handle_privatelink_endpoint(
+            endpoint,
+            &mut broker_rewrite_map,
+            &link_targets,
+            &broker_addrs,
+        )
+        .unwrap();
+
+        assert_eq!(broker_rewrite_map.len(), 2);
+        assert_eq!(broker_rewrite_map["broker1:9092"], "some_url:9092");
+        assert_eq!(broker_rewrite_map["broker2:9093"], "some_url:9093");
+
+        // example 2: json array
+        let endpoint = r#"[{"host": "aaaa"}, {"host": "bbbb"}, {"host": "cccc"}]"#;
+        let broker_addrs = vec!["broker1:9092", "broker2:9093", "broker3:9094"];
+        let link_targets = vec![
+            AwsPrivateLinkItem {
+                az_id: None,
+                port: 9092,
+            },
+            AwsPrivateLinkItem {
+                az_id: None,
+                port: 9093,
+            },
+            AwsPrivateLinkItem {
+                az_id: None,
+                port: 9094,
+            },
+        ];
+        let mut broker_rewrite_map = HashMap::new();
+        handle_privatelink_endpoint(
+            endpoint,
+            &mut broker_rewrite_map,
+            &link_targets,
+            &broker_addrs,
+        )
+        .unwrap();
+
+        assert_eq!(broker_rewrite_map.len(), 3);
+        assert_eq!(broker_rewrite_map["broker1:9092"], "aaaa:9092");
+        assert_eq!(broker_rewrite_map["broker2:9093"], "bbbb:9093");
+        assert_eq!(broker_rewrite_map["broker3:9094"], "cccc:9094");
+
+        // no `host` in the json array
+        let endpoint = r#"[{"somekey_1": "aaaa"}, {"somekey_2": "bbbb"}, {"somekey_3": "cccc"}]"#;
+        let mut broker_rewrite_map = HashMap::new();
+        let err = handle_privatelink_endpoint(
+            endpoint,
+            &mut broker_rewrite_map,
+            &link_targets,
+            &broker_addrs,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "expect json schema {\"host\": \"endpoint url\"} but got {\"somekey_1\":\"aaaa\"}"
+        );
+
+        // illegal json
+        let endpoint = r#"{}"#;
+        let mut broker_rewrite_map = HashMap::new();
+        let err = handle_privatelink_endpoint(
+            endpoint,
+            &mut broker_rewrite_map,
+            &link_targets,
+            &broker_addrs,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "expect a string or a json array for privatelink.endpoint, but got Object {}"
+        );
+    }
 }

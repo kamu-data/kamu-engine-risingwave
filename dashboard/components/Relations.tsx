@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,12 @@
 import {
   Box,
   Button,
+  Popover,
+  PopoverArrow,
+  PopoverBody,
+  PopoverCloseButton,
+  PopoverContent,
+  PopoverTrigger,
   Table,
   TableContainer,
   Tbody,
@@ -33,7 +39,14 @@ import Link from "next/link"
 import { Fragment } from "react"
 import Title from "../components/Title"
 import useFetch from "../lib/api/fetch"
-import { Relation, StreamingJob } from "../lib/api/streaming"
+import {
+  Relation,
+  StreamingJob,
+  getDatabases,
+  getSchemas,
+  getStreamingJobs,
+  getUsers,
+} from "../lib/api/streaming"
 import extractColumnInfo from "../lib/extractInfo"
 import {
   Sink as RwSink,
@@ -54,7 +67,7 @@ export const dependentsColumn: Column<Relation> = {
   name: "Depends",
   width: 1,
   content: (r) => (
-    <Link href={`/dependency_graph/?id=${r.id}`}>
+    <Link href={`/relation_graph/?id=${r.id}`}>
       <Button
         size="sm"
         aria-label="view dependents"
@@ -67,7 +80,7 @@ export const dependentsColumn: Column<Relation> = {
   ),
 }
 
-export const fragmentsColumn: Column<StreamingJob> = {
+export const fragmentsColumn: Column<Relation> = {
   name: "Fragments",
   width: 1,
   content: (r) => (
@@ -95,6 +108,33 @@ export const primaryKeyColumn: Column<RwTable> = {
       .join(", "),
 }
 
+export const vnodeCountColumn: Column<RwTable> = {
+  name: "Vnode Count",
+  width: 1,
+  // The table catalogs retrieved here are constructed from SQL models,
+  // where the `vnode_count` column has already been populated during migration.
+  // Therefore, it should always be present and no need to specify a fallback.
+  content: (r) => r.maybeVnodeCount ?? "?",
+}
+
+// Helper function to format bytes into human readable format
+function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined) return "unknown"
+  if (bytes === 0) return "0 B"
+  const k = 1024
+  const sizes = ["B", "KB", "MB", "GB", "TB"]
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i]
+}
+
+export const dataSizeColumn: Column<Relation> = {
+  name: "Data Size",
+  width: 2,
+  content: (r) => formatBytes(r.totalSizeBytes),
+}
+
+export const tableColumns = [primaryKeyColumn, vnodeCountColumn, dataSizeColumn]
+
 export const connectorColumnSource: Column<RwSource> = {
   name: "Connector",
   width: 3,
@@ -107,14 +147,80 @@ export const connectorColumnSink: Column<RwSink> = {
   content: (r) => r.properties.connector ?? "unknown",
 }
 
-export const streamingJobColumns = [dependentsColumn, fragmentsColumn]
+export const configOverrideColumn: Column<Relation> = {
+  name: "Config Override",
+  width: 3,
+  content: (r) => {
+    const override = r.streamingJob?.configOverride?.trim()
+    if (!override) {
+      return "-"
+    }
+    return (
+      <Popover placement="auto" trigger="click">
+        <PopoverTrigger>
+          <Button size="sm" variant="link" colorScheme="blue">
+            C
+          </Button>
+        </PopoverTrigger>
+        <PopoverContent maxW="lg">
+          <PopoverArrow />
+          <PopoverCloseButton />
+          <PopoverBody fontFamily="mono" whiteSpace="pre-wrap">
+            {override}
+          </PopoverBody>
+        </PopoverContent>
+      </Popover>
+    )
+  },
+}
+
+export const streamingJobColumns = [
+  dependentsColumn,
+  fragmentsColumn,
+  configOverrideColumn,
+]
 
 export function Relations<R extends Relation>(
   title: string,
   getRelations: () => Promise<R[]>,
-  extraColumns: Column<R>[]
+  extraColumns: Column<R>[],
+  options?: {
+    withStreamingJobs?: boolean
+  }
 ) {
-  const { response: relationList } = useFetch(getRelations)
+  const { response: relationList } = useFetch(async () => {
+    const streamingJobsPromise = options?.withStreamingJobs
+      ? getStreamingJobs()
+      : undefined
+    const [relations, users, databases, schemas] = await Promise.all([
+      getRelations(),
+      getUsers(),
+      getDatabases(),
+      getSchemas(),
+    ])
+    const streamingJobs = streamingJobsPromise
+      ? await streamingJobsPromise
+      : undefined
+    const streamingJobMap = streamingJobs?.reduce<Map<number, StreamingJob>>(
+      (acc, job) => {
+        acc.set(job.id, job)
+        return acc
+      },
+      new Map()
+    )
+
+    return relations.map((r) => {
+      // Add owner, schema, and database names. It's linear search but the list is small.
+      const owner = users.find((u) => u.id === r.owner)
+      const ownerName = owner?.name
+      const schema = schemas.find((s) => s.id === r.schemaId)
+      const schemaName = schema?.name
+      const database = databases.find((d) => d.id === r.databaseId)
+      const databaseName = database?.name
+      const streamingJob = streamingJobMap?.get(r.id)
+      return { streamingJob, ...r, ownerName, schemaName, databaseName }
+    })
+  })
   const [modalData, setModalId] = useCatalogModal(relationList)
 
   const modal = (
@@ -124,11 +230,19 @@ export function Relations<R extends Relation>(
   const table = (
     <Box p={3}>
       <Title>{title}</Title>
+      {relationList && (
+        <Box mb={3} fontSize="sm" color="gray.600">
+          Total: {relationList.length}{" "}
+          {relationList.length === 1 ? "item" : "items"}
+        </Box>
+      )}
       <TableContainer>
         <Table variant="simple" size="sm" maxWidth="full">
           <Thead>
             <Tr>
               <Th width={3}>Id</Th>
+              <Th width={5}>Database</Th>
+              <Th width={5}>Schema</Th>
               <Th width={5}>Name</Th>
               <Th width={3}>Owner</Th>
               {extraColumns.map((c) => (
@@ -153,17 +267,23 @@ export function Relations<R extends Relation>(
                     {r.id}
                   </Button>
                 </Td>
+                <Td>{r.databaseName}</Td>
+                <Td>{r.schemaName}</Td>
                 <Td>{r.name}</Td>
-                <Td>{r.owner}</Td>
+                <Td>{r.ownerName}</Td>
                 {extraColumns.map((c) => (
                   <Td key={c.name}>{c.content(r)}</Td>
                 ))}
-                <Td overflowWrap="normal">
-                  {r.columns
-                    .filter((col) => ("isHidden" in col ? !col.isHidden : true))
-                    .map((col) => extractColumnInfo(col))
-                    .join(", ")}
-                </Td>
+                {r.columns && r.columns.length > 0 && (
+                  <Td overflowWrap="normal">
+                    {r.columns
+                      .filter((col) =>
+                        "isHidden" in col ? !col.isHidden : true
+                      )
+                      .map((col) => extractColumnInfo(col))
+                      .join(", ")}
+                  </Td>
+                )}
               </Tr>
             ))}
           </Tbody>

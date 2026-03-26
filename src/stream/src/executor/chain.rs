@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::StreamExt;
-use futures_async_stream::try_stream;
-
-use super::error::StreamExecutorError;
-use super::{expect_first_barrier, Execute, Executor, Message};
-use crate::task::{ActorId, CreateMviewProgress};
+use crate::executor::prelude::*;
+use crate::task::CreateMviewProgressReporter;
 
 /// [`ChainExecutor`] is an executor that enables synchronization between the existing stream and
 /// newly appended executors. Currently, [`ChainExecutor`] is mainly used to implement MV on MV
@@ -28,7 +24,7 @@ pub struct ChainExecutor {
 
     upstream: Executor,
 
-    progress: CreateMviewProgress,
+    progress: CreateMviewProgressReporter,
 
     actor_id: ActorId,
 
@@ -40,7 +36,7 @@ impl ChainExecutor {
     pub fn new(
         snapshot: Executor,
         upstream: Executor,
-        progress: CreateMviewProgress,
+        progress: CreateMviewProgressReporter,
         upstream_only: bool,
     ) -> Self {
         Self {
@@ -68,7 +64,7 @@ impl ChainExecutor {
         // If the barrier is a conf change of creating this mview, and the snapshot is not to be
         // consumed, we can finish the progress immediately.
         if barrier.is_newly_added(self.actor_id) && self.upstream_only {
-            self.progress.finish(barrier.epoch.curr, 0);
+            self.progress.finish(barrier.epoch, 0);
         }
 
         // The first barrier message should be propagated.
@@ -92,7 +88,7 @@ impl ChainExecutor {
         for msg in upstream {
             let msg = msg?;
             if to_consume_snapshot && let Message::Barrier(barrier) = &msg {
-                self.progress.finish(barrier.epoch.curr, 0);
+                self.progress.finish(barrier.epoch, 0);
             }
             yield msg;
         }
@@ -107,11 +103,10 @@ impl Execute for ChainExecutor {
 
 #[cfg(test)]
 mod test {
-    use std::default::Default;
 
     use futures::StreamExt;
-    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::array::StreamChunk;
+    use risingwave_common::array::stream_chunk::StreamChunkTestExt;
     use risingwave_common::catalog::{Field, Schema};
     use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
@@ -119,13 +114,15 @@ mod test {
 
     use super::ChainExecutor;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::{AddMutation, Barrier, Execute, Message, Mutation, PkIndices};
-    use crate::task::{CreateMviewProgress, LocalBarrierManager};
+    use crate::executor::{AddMutation, Barrier, Execute, Message, Mutation, StreamKey};
+    use crate::task::CreateMviewProgressReporter;
+    use crate::task::barrier_test_utils::LocalBarrierTestEnv;
 
     #[tokio::test]
     async fn test_basic() {
-        let barrier_manager = LocalBarrierManager::for_test();
-        let progress = CreateMviewProgress::for_test(barrier_manager);
+        let test_env = LocalBarrierTestEnv::for_test().await;
+        let barrier_manager = test_env.local_barrier_manager.clone();
+        let progress = CreateMviewProgressReporter::for_test(barrier_manager);
         let actor_id = progress.actor_id();
 
         let schema = Schema::new(vec![Field::unnamed(DataType::Int64)]);
@@ -134,26 +131,25 @@ mod test {
             StreamChunk::from_pretty("I\n + 2"),
         ])
         .stop_on_finish(false)
-        .into_executor(schema.clone(), PkIndices::new());
+        .into_executor(schema.clone(), StreamKey::new());
 
         let second = MockSource::with_messages(vec![
             Message::Barrier(Barrier::new_test_barrier(test_epoch(1)).with_mutation(
                 Mutation::Add(AddMutation {
                     adds: maplit::hashmap! {
-                        0 => vec![Dispatcher {
+                        0.into() => vec![Dispatcher {
                             downstream_actor_id: vec![actor_id],
                             ..Default::default()
                         }],
                     },
                     added_actors: maplit::hashset! { actor_id },
-                    splits: Default::default(),
-                    pause: false,
+                    ..Default::default()
                 }),
             )),
             Message::Chunk(StreamChunk::from_pretty("I\n + 3")),
             Message::Chunk(StreamChunk::from_pretty("I\n + 4")),
         ])
-        .into_executor(schema.clone(), PkIndices::new());
+        .into_executor(schema.clone(), StreamKey::new());
 
         let chain = ChainExecutor::new(first, second, progress, false);
 

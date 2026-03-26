@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod prelude {
+    // import all split enumerators
+    pub use crate::source::datagen::DatagenSplitEnumerator;
+    pub use crate::source::filesystem::LegacyS3SplitEnumerator;
+    pub use crate::source::filesystem::opendal_source::OpendalEnumerator;
+    pub use crate::source::google_pubsub::PubsubSplitEnumerator as GooglePubsubSplitEnumerator;
+    pub use crate::source::iceberg::IcebergSplitEnumerator;
+    pub use crate::source::kafka::KafkaSplitEnumerator;
+    pub use crate::source::kinesis::KinesisSplitEnumerator;
+    pub use crate::source::mqtt::MqttSplitEnumerator;
+    pub use crate::source::nats::NatsSplitEnumerator;
+    pub use crate::source::nexmark::NexmarkSplitEnumerator;
+    pub use crate::source::pulsar::PulsarSplitEnumerator;
+    pub use crate::source::test_source::TestSourceSplitEnumerator as TestSplitEnumerator;
+    pub type AzblobSplitEnumerator =
+        OpendalEnumerator<crate::source::filesystem::opendal_source::OpendalAzblob>;
+    pub type GcsSplitEnumerator =
+        OpendalEnumerator<crate::source::filesystem::opendal_source::OpendalGcs>;
+    pub type OpendalS3SplitEnumerator =
+        OpendalEnumerator<crate::source::filesystem::opendal_source::OpendalS3>;
+    pub type PosixFsSplitEnumerator =
+        OpendalEnumerator<crate::source::filesystem::opendal_source::OpendalPosixFs>;
+    pub use crate::source::cdc::enumerator::DebeziumSplitEnumerator;
+    pub use crate::source::filesystem::opendal_source::BatchPosixFsEnumerator as BatchPosixFsSplitEnumerator;
+    pub type CitusCdcSplitEnumerator = DebeziumSplitEnumerator<crate::source::cdc::Citus>;
+    pub type MongodbCdcSplitEnumerator = DebeziumSplitEnumerator<crate::source::cdc::Mongodb>;
+    pub type PostgresCdcSplitEnumerator = DebeziumSplitEnumerator<crate::source::cdc::Postgres>;
+    pub type MysqlCdcSplitEnumerator = DebeziumSplitEnumerator<crate::source::cdc::Mysql>;
+    pub type SqlServerCdcSplitEnumerator = DebeziumSplitEnumerator<crate::source::cdc::SqlServer>;
+}
+
 pub mod base;
+pub mod batch;
 pub mod cdc;
 pub mod data_gen_util;
 pub mod datagen;
@@ -26,28 +58,48 @@ pub mod nats;
 pub mod nexmark;
 pub mod odf;
 pub mod pulsar;
-pub use base::{UPSTREAM_SOURCE_KEY, *};
+pub mod utils;
+
+mod util;
+use std::future::IntoFuture;
+
+pub use base::{UPSTREAM_SOURCE_KEY, WEBHOOK_CONNECTOR, *};
+pub use batch::BatchSourceSplitImpl;
 pub(crate) use common::*;
+use google_cloud_pubsub::subscription::Subscription;
 pub use google_pubsub::GOOGLE_PUBSUB_CONNECTOR;
 pub use kafka::KAFKA_CONNECTOR;
 pub use kinesis::KINESIS_CONNECTOR;
 pub use mqtt::MQTT_CONNECTOR;
 pub use nats::NATS_CONNECTOR;
+use utils::feature_gated_source_mod;
+
+pub use self::adbc_snowflake::ADBC_SNOWFLAKE_CONNECTOR;
 mod common;
 pub mod iceberg;
 mod manager;
 pub mod reader;
 pub mod test_source;
+feature_gated_source_mod!(adbc_snowflake, "adbc_snowflake");
 
+use async_nats::jetstream::consumer::AckPolicy as JetStreamAckPolicy;
+use async_nats::jetstream::context::Context as JetStreamContext;
 pub use manager::{SourceColumnDesc, SourceColumnType};
+use risingwave_common::array::{Array, ArrayRef};
+use risingwave_common::row::OwnedRow;
+use risingwave_pb::id::SourceId;
+use thiserror_ext::AsReport;
+pub use util::fill_adaptive_split;
 
+pub use crate::source::filesystem::LEGACY_S3_CONNECTOR;
 pub use crate::source::filesystem::opendal_source::{
-    GCS_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR,
+    AZBLOB_CONNECTOR, BATCH_POSIX_FS_CONNECTOR, GCS_CONNECTOR, OPENDAL_S3_CONNECTOR,
+    POSIX_FS_CONNECTOR,
 };
-pub use crate::source::filesystem::S3_CONNECTOR;
 pub use crate::source::nexmark::NEXMARK_CONNECTOR;
 pub use crate::source::odf::ODF_CONNECTOR;
 pub use crate::source::pulsar::PULSAR_CONNECTOR;
+use crate::source::pulsar::source::reader::PULSAR_ACK_CHANNEL;
 
 pub fn should_copy_to_format_encode_options(key: &str, connector: &str) -> bool {
     const PREFIXES: &[&str] = &[
@@ -69,4 +121,146 @@ pub fn should_copy_to_format_encode_options(key: &str, connector: &str) -> bool 
     ];
     PREFIXES.iter().any(|prefix| key.starts_with(prefix))
         || (key == "endpoint" && !connector.eq_ignore_ascii_case(KINESIS_CONNECTOR))
+}
+
+/// Tasks executed by `WaitCheckpointWorker`
+pub enum WaitCheckpointTask {
+    CommitCdcOffset(Option<(SplitId, String)>),
+    AckPubsubMessage(Subscription, Vec<ArrayRef>),
+    AckNatsJetStream(JetStreamContext, Vec<ArrayRef>, JetStreamAckPolicy),
+    AckPulsarMessage(Vec<(String, ArrayRef)>),
+}
+
+impl WaitCheckpointTask {
+    pub async fn run(self) {
+        self.run_with_on_commit_success(|_source_id, _offset| {
+            // Default implementation: no action on commit success
+        })
+        .await;
+    }
+
+    pub async fn run_with_on_commit_success<F>(self, mut on_commit_success: F)
+    where
+        F: FnMut(u64, &str),
+    {
+        use std::str::FromStr;
+        match self {
+            WaitCheckpointTask::CommitCdcOffset(updated_offset) => {
+                if let Some((split_id, offset)) = updated_offset {
+                    let source_id: u64 = u64::from_str(split_id.as_ref()).unwrap();
+                    // notify cdc connector to commit offset
+                    match cdc::jni_source::commit_cdc_offset(source_id, offset.clone()) {
+                        Ok(()) => {
+                            // Execute callback after successful commit
+                            on_commit_success(source_id, &offset);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e.as_report(),
+                                "source#{source_id}: failed to commit cdc offset: {offset}.",
+                            )
+                        }
+                    }
+                }
+            }
+            WaitCheckpointTask::AckPulsarMessage(ack_array) => {
+                if let Some((ack_channel_id, to_cumulative_ack)) = ack_array.last() {
+                    let encode_message_id_data = to_cumulative_ack
+                        .as_bytea()
+                        .iter()
+                        .last()
+                        .flatten()
+                        .map(|x| x.to_owned())
+                        .unwrap();
+                    if let Some(ack_tx) = PULSAR_ACK_CHANNEL.get(ack_channel_id).await {
+                        let _ = ack_tx.send(encode_message_id_data);
+                    }
+                }
+            }
+            WaitCheckpointTask::AckPubsubMessage(subscription, ack_id_arrs) => {
+                async fn ack(subscription: &Subscription, ack_ids: Vec<String>) {
+                    tracing::trace!("acking pubsub messages {:?}", ack_ids);
+                    match subscription.ack(ack_ids).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e.as_report(),
+                                "failed to ack pubsub messages",
+                            )
+                        }
+                    }
+                }
+                const MAX_ACK_BATCH_SIZE: usize = 1000;
+                let mut ack_ids: Vec<String> = vec![];
+                for arr in ack_id_arrs {
+                    for ack_id in arr.as_utf8().iter().flatten() {
+                        ack_ids.push(ack_id.to_owned());
+                        if ack_ids.len() >= MAX_ACK_BATCH_SIZE {
+                            ack(&subscription, std::mem::take(&mut ack_ids)).await;
+                        }
+                    }
+                }
+                ack(&subscription, ack_ids).await;
+            }
+            WaitCheckpointTask::AckNatsJetStream(
+                ref context,
+                reply_subjects_arrs,
+                ref ack_policy,
+            ) => {
+                async fn ack(context: &JetStreamContext, reply_subject: String) {
+                    match context.publish(reply_subject.clone(), "+ACK".into()).await {
+                        Err(e) => {
+                            tracing::error!(error = %e.as_report(), subject = ?reply_subject, "failed to ack NATS JetStream message");
+                        }
+                        Ok(ack_future) => {
+                            let _ = ack_future.into_future().await;
+                        }
+                    }
+                }
+
+                let reply_subjects = reply_subjects_arrs
+                    .iter()
+                    .flat_map(|arr| {
+                        arr.as_utf8()
+                            .iter()
+                            .flatten()
+                            .map(|s| s.to_owned())
+                            .collect::<Vec<String>>()
+                    })
+                    .collect::<Vec<String>>();
+
+                match ack_policy {
+                    JetStreamAckPolicy::None => (),
+                    JetStreamAckPolicy::Explicit => {
+                        for reply_subject in reply_subjects {
+                            if reply_subject.is_empty() {
+                                continue;
+                            }
+                            ack(context, reply_subject).await;
+                        }
+                    }
+                    JetStreamAckPolicy::All => {
+                        if let Some(reply_subject) = reply_subjects.last() {
+                            ack(context, reply_subject.clone()).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CdcTableSnapshotSplitCommon<T: Clone> {
+    pub split_id: i64,
+    pub left_bound_inclusive: T,
+    pub right_bound_exclusive: T,
+}
+
+pub type CdcTableSnapshotSplit = CdcTableSnapshotSplitCommon<OwnedRow>;
+pub type CdcTableSnapshotSplitRaw = CdcTableSnapshotSplitCommon<Vec<u8>>;
+
+#[inline]
+pub fn build_pulsar_ack_channel_id(source_id: SourceId, split_id: &SplitId) -> String {
+    format!("{}-{}", source_id, split_id)
 }

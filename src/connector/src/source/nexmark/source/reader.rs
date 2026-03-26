@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt};
 use futures_async_stream::try_stream;
+use nexmark::EventGenerator;
 use nexmark::config::NexmarkConfig;
 use nexmark::event::EventType;
-use nexmark::EventGenerator;
 use risingwave_common::array::stream_chunk_builder::StreamChunkBuilder;
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::row::OwnedRow;
@@ -35,12 +35,13 @@ use crate::source::nexmark::source::combined_event::{
 };
 use crate::source::nexmark::{NexmarkProperties, NexmarkSplit};
 use crate::source::{
-    BoxChunkSourceStream, Column, SourceContextRef, SplitId, SplitMetaData, SplitReader,
+    BoxSourceChunkStream, Column, SourceContextRef, SplitId, SplitMetaData, SplitReader,
 };
 
 #[derive(Debug)]
 pub struct NexmarkSplitReader {
     generator: EventGenerator,
+    #[expect(dead_code)]
     assigned_split: NexmarkSplit,
     event_num: u64,
     event_type: Option<EventType>,
@@ -106,39 +107,29 @@ impl SplitReader for NexmarkSplitReader {
         })
     }
 
-    fn into_stream(self) -> BoxChunkSourceStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         let actor_id = self.source_ctx.actor_id.to_string();
         let fragment_id = self.source_ctx.fragment_id.to_string();
         let source_id = self.source_ctx.source_id.to_string();
-        let source_name = self.source_ctx.source_name.to_string();
+        let source_name = self.source_ctx.source_name.clone();
         let split_id = self.split_id.clone();
         let metrics = self.source_ctx.metrics.clone();
+
+        let labels: &[&str] = &[&actor_id, &source_id, &split_id, &source_name, &fragment_id];
+        let partition_input_count_metric = metrics
+            .partition_input_count
+            .with_guarded_label_values(labels);
+        let partition_input_bytes_metric = metrics
+            .partition_input_bytes
+            .with_guarded_label_values(labels);
 
         // Will buffer at most 4 event chunks.
         const BUFFER_SIZE: usize = 4;
         spawn_data_generation_stream(
             self.into_native_stream()
                 .inspect_ok(move |chunk: &StreamChunk| {
-                    metrics
-                        .partition_input_count
-                        .with_label_values(&[
-                            &actor_id,
-                            &source_id,
-                            &split_id,
-                            &source_name,
-                            &fragment_id,
-                        ])
-                        .inc_by(chunk.cardinality() as u64);
-                    metrics
-                        .partition_input_bytes
-                        .with_label_values(&[
-                            &actor_id,
-                            &source_id,
-                            &split_id,
-                            &source_name,
-                            &fragment_id,
-                        ])
-                        .inc_by(chunk.estimated_size() as u64);
+                    partition_input_count_metric.inc_by(chunk.cardinality() as u64);
+                    partition_input_bytes_metric.inc_by(chunk.estimated_size() as u64);
                 }),
             BUFFER_SIZE,
         )
@@ -210,8 +201,8 @@ impl NexmarkSplitReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::nexmark::{NexmarkProperties, NexmarkSplitEnumerator};
-    use crate::source::{SourceEnumeratorContext, SplitEnumerator};
+    use crate::source::nexmark::NexmarkSplitEnumerator;
+    use crate::source::{SourceContext, SourceEnumeratorContext, SplitEnumerator};
 
     #[tokio::test]
     async fn test_nexmark_split_reader() -> crate::error::ConnectorResult<()> {
@@ -224,7 +215,7 @@ mod tests {
         };
 
         let mut enumerator =
-            NexmarkSplitEnumerator::new(props.clone(), SourceEnumeratorContext::default().into())
+            NexmarkSplitEnumerator::new(props.clone(), SourceEnumeratorContext::dummy().into())
                 .await?;
         let list_splits_resp: Vec<_> = enumerator.list_splits().await?.into_iter().collect();
 
@@ -236,7 +227,7 @@ mod tests {
                 props.clone(),
                 state,
                 Default::default(),
-                Default::default(),
+                SourceContext::dummy().into(),
                 None,
             )
             .await?
@@ -261,7 +252,7 @@ mod tests {
         };
 
         let mut enumerator =
-            NexmarkSplitEnumerator::new(props.clone(), SourceEnumeratorContext::default().into())
+            NexmarkSplitEnumerator::new(props.clone(), SourceEnumeratorContext::dummy().into())
                 .await?;
         let list_splits_resp: Vec<_> = enumerator.list_splits().await?.into_iter().collect();
 
@@ -271,7 +262,7 @@ mod tests {
                 props.clone(),
                 state,
                 Default::default(),
-                Default::default(),
+                SourceContext::dummy().into(),
                 None,
             )
             .await?

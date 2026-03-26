@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_common::array::{Op, StreamChunk};
-use risingwave_common::row::{OwnedRow, Row, RowExt};
+use risingwave_common::array::Op;
+use risingwave_common::row::RowExt;
 use risingwave_common_estimate_size::collections::{EstimatedHashSet, EstimatedVec};
 
-use crate::cache::{new_unbounded, ManagedLruCache};
+use crate::cache::ManagedLruCache;
 use crate::common::metrics::MetricsInfo;
-use crate::task::AtomicU64Ref;
+use crate::consistency::consistency_panic;
+use crate::executor::prelude::*;
 
 pub type LookupEntryState = EstimatedHashSet<OwnedRow>;
 
@@ -35,7 +36,7 @@ impl LookupCache {
 
     /// Update a key after lookup cache misses.
     pub fn batch_update(&mut self, key: OwnedRow, value: EstimatedVec<OwnedRow>) {
-        self.data.push(key, LookupEntryState::from_vec(value));
+        self.data.put(key, LookupEntryState::from_vec(value));
     }
 
     /// Apply a batch from the arrangement side
@@ -48,12 +49,12 @@ impl LookupCache {
                 match op {
                     Op::Insert | Op::UpdateInsert => {
                         if !values.insert(row) {
-                            panic!("inserting a duplicated value");
+                            consistency_panic!("inserting a duplicated value");
                         }
                     }
                     Op::Delete | Op::UpdateDelete => {
                         if !values.remove(&row) {
-                            panic!("row {:?} should be in the cache", row);
+                            consistency_panic!("row {:?} should be in the cache", row);
                         }
                     }
                 }
@@ -69,18 +70,13 @@ impl LookupCache {
         self.data.len()
     }
 
-    /// Update the current epoch.
-    pub fn update_epoch(&mut self, epoch: u64) {
-        self.data.update_epoch(epoch);
-    }
-
     /// Clear the cache.
     pub fn clear(&mut self) {
         self.data.clear();
     }
 
-    pub fn new(watermark_epoch: AtomicU64Ref, metrics_info: MetricsInfo) -> Self {
-        let cache = new_unbounded(watermark_epoch, metrics_info);
+    pub fn new(watermark_sequence: AtomicU64Ref, metrics_info: MetricsInfo) -> Self {
+        let cache = ManagedLruCache::unbounded(watermark_sequence, metrics_info);
         Self { data: cache }
     }
 }

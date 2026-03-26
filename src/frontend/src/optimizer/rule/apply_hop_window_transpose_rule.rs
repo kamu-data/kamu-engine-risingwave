@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,8 @@
 
 use risingwave_pb::plan_common::JoinType;
 
-use super::{BoxedRule, Rule};
+use super::prelude::{PlanRef, *};
 use crate::optimizer::plan_node::{LogicalApply, LogicalFilter, LogicalHopWindow};
-use crate::optimizer::PlanRef;
 use crate::utils::Condition;
 
 /// Transpose `LogicalApply` and `LogicalHopWindow`.
@@ -41,7 +40,7 @@ use crate::utils::Condition;
 ///  Domain        Input
 /// ```
 pub struct ApplyHopWindowTransposeRule {}
-impl Rule for ApplyHopWindowTransposeRule {
+impl Rule<Logical> for ApplyHopWindowTransposeRule {
     fn apply(&self, plan: PlanRef) -> Option<PlanRef> {
         let apply: &LogicalApply = plan.as_logical_apply()?;
         let (left, right, on, join_type, correlated_id, correlated_indices, max_one_row) =
@@ -62,7 +61,7 @@ impl Rule for ApplyHopWindowTransposeRule {
             return None;
         }
 
-        let new_apply = LogicalApply::new(
+        let new_apply = LogicalApply::create(
             left,
             hop_window_input,
             JoinType::Inner,
@@ -70,8 +69,7 @@ impl Rule for ApplyHopWindowTransposeRule {
             correlated_id,
             correlated_indices,
             false,
-        )
-        .into();
+        );
 
         let new_hop_window = LogicalHopWindow::create(
             new_apply,

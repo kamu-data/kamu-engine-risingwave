@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
 
 use risingwave_common::types::Fields;
 use risingwave_frontend_macro::system_catalog;
+use risingwave_pb::id::SchemaId;
 
-use crate::catalog::system_catalog::rw_catalog::rw_types::read_rw_types;
 use crate::catalog::system_catalog::SysCatalogReaderImpl;
+use crate::catalog::system_catalog::rw_catalog::rw_types::read_rw_types;
 use crate::error::Result;
 
 /// The catalog `pg_type` stores information about data types.
-/// Ref: [`https://www.postgresql.org/docs/current/catalog-pg-type.html`]
+/// Ref: `https://www.postgresql.org/docs/current/catalog-pg-type.html`
 
 // TODO: Make it a view atop of `rw_types` to reduce code duplication of the
 // `read` function, while reserving the property that `oid` acts as the
@@ -41,6 +42,7 @@ use crate::error::Result;
 //         0 AS typlen,
 //         s.id AS typnamespace,
 //         'b' AS typtype,
+//         ',' AS typdelim,
 //         0 AS typrelid,
 //         NULL AS typdefault,
 //         NULL AS typcategory,
@@ -62,8 +64,9 @@ struct PgType {
     typtypmod: i32,
     typcollation: i32,
     typlen: i32,
-    typnamespace: i32,
-    typtype: &'static str,
+    typnamespace: SchemaId,
+    typtype: char,
+    typdelim: char,
     typrelid: i32,
     typdefault: Option<String>,
     typcategory: Option<String>,
@@ -75,7 +78,7 @@ fn read_pg_type(reader: &SysCatalogReaderImpl) -> Result<Vec<PgType>> {
     let catalog_reader = reader.catalog_reader.read_guard();
     let pg_catalog_id = catalog_reader
         .get_schema_by_name(&reader.auth_context.database, "pg_catalog")?
-        .id() as i32;
+        .id();
 
     let rw_types = read_rw_types(reader)?;
 
@@ -93,7 +96,8 @@ fn read_pg_type(reader: &SysCatalogReaderImpl) -> Result<Vec<PgType>> {
             typcollation: 0,
             typlen: 0,
             typnamespace: pg_catalog_id,
-            typtype: "b",
+            typtype: 'b',
+            typdelim: ',',
             typrelid: 0,
             typdefault: None,
             typcategory: None,

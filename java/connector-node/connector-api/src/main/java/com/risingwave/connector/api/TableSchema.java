@@ -1,16 +1,18 @@
-// Copyright 2024 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright 2023 RisingWave Labs
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package com.risingwave.connector.api;
 
@@ -20,12 +22,18 @@ import com.risingwave.proto.Data;
 import com.risingwave.proto.Data.DataType.TypeName;
 import com.risingwave.proto.PlanCommon;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TableSchema {
+
+    static final Logger LOG = LoggerFactory.getLogger(TableSchema.class);
+
     private final List<String> columnNames;
     private final Map<String, TypeName> columns;
     private final Map<String, Integer> columnIndices;
@@ -80,16 +88,20 @@ public class TableSchema {
     }
 
     public static TableSchema fromProto(ConnectorServiceProto.TableSchema tableSchema) {
-        return new TableSchema(
-                tableSchema.getColumnsList().stream()
-                        .map(PlanCommon.ColumnDesc::getName)
-                        .collect(Collectors.toList()),
-                tableSchema.getColumnsList().stream()
-                        .map(PlanCommon.ColumnDesc::getColumnType)
-                        .collect(Collectors.toList()),
-                tableSchema.getPkIndicesList().stream()
-                        .map(i -> tableSchema.getColumns(i).getName())
-                        .collect(Collectors.toList()));
+        // filter out additional columns
+        var instance =
+                new TableSchema(
+                        tableSchema.getColumnsList().stream()
+                                .map(PlanCommon.ColumnDesc::getName)
+                                .collect(Collectors.toList()),
+                        tableSchema.getColumnsList().stream()
+                                .map(PlanCommon.ColumnDesc::getColumnType)
+                                .collect(Collectors.toList()),
+                        tableSchema.getPkIndicesList().stream()
+                                .map(i -> tableSchema.getColumns(i).getName())
+                                .collect(Collectors.toList()));
+        LOG.info("table column names: {}", Arrays.toString(instance.getColumnNames()));
+        return instance;
     }
 
     public List<String> getPrimaryKeys() {

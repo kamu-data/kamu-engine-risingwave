@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,14 +13,14 @@
 // limitations under the License.
 
 #![feature(error_generic_member_access)]
-#![feature(lazy_cell)]
 #![feature(once_cell_try)]
 #![feature(type_alias_impl_trait)]
 #![feature(try_blocks)]
+#![feature(used_with_arg)]
 
-pub mod hummock_iterator;
 pub mod jvm_runtime;
 mod macros;
+mod opendal_schema_history;
 mod tracing_slf4j;
 
 use std::backtrace::Backtrace;
@@ -32,39 +32,49 @@ use std::sync::{LazyLock, OnceLock};
 use anyhow::anyhow;
 use bytes::Bytes;
 use cfg_or_panic::cfg_or_panic;
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use chrono::{DateTime, Datelike, Timelike};
+use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use jni::JNIEnv;
 use jni::objects::{
     AutoElements, GlobalRef, JByteArray, JClass, JMethodID, JObject, JStaticMethodID, JString,
     JValueOwned, ReleaseMode,
 };
 use jni::signature::ReturnType;
 use jni::sys::{
-    jboolean, jbyte, jdouble, jfloat, jint, jlong, jshort, jsize, jvalue, JNI_FALSE, JNI_TRUE,
+    JNI_FALSE, JNI_TRUE, jboolean, jbyte, jdouble, jfloat, jint, jlong, jshort, jsize, jvalue,
 };
-use jni::JNIEnv;
+pub use paste::paste;
 use prost::{DecodeError, Message};
 use risingwave_common::array::{ArrayError, StreamChunk};
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::row::{OwnedRow, Row};
 use risingwave_common::test_prelude::StreamChunkTestExt;
-use risingwave_common::types::ScalarRefImpl;
+use risingwave_common::types::{Decimal, ScalarRefImpl};
 use risingwave_common::util::panic::rw_catch_unwind;
 use risingwave_pb::connector_service::{
     GetEventStreamResponse, SinkCoordinatorStreamRequest, SinkCoordinatorStreamResponse,
     SinkWriterStreamRequest, SinkWriterStreamResponse,
 };
 use risingwave_pb::data::Op;
-use risingwave_storage::error::StorageError;
 use thiserror::Error;
 use thiserror_ext::AsReport;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing_slf4j::*;
 
-use crate::hummock_iterator::HummockJavaBindingIterator;
-pub use crate::jvm_runtime::register_native_method_for_jvm;
+/// Enable JVM and Java libraries.
+///
+/// This macro forces this crate to be linked, which registers the JVM builder.
+#[macro_export]
+macro_rules! enable {
+    () => {
+        use risingwave_jni_core as _;
+    };
+}
 
-static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
+pub static JAVA_BINDING_ASYNC_RUNTIME: LazyLock<Runtime> =
+    LazyLock::new(|| tokio::runtime::Runtime::new().unwrap());
 
 #[derive(Error, Debug)]
 pub enum BindingError {
@@ -78,7 +88,7 @@ pub enum BindingError {
     #[error("StorageError {error}")]
     Storage {
         #[from]
-        error: StorageError,
+        error: anyhow::Error,
         backtrace: Backtrace,
     },
 
@@ -120,7 +130,7 @@ pub struct SliceGuard<'env, 'array> {
     slice: &'array [u8],
 }
 
-impl<'env, 'array> Deref for SliceGuard<'env, 'array> {
+impl Deref for SliceGuard<'_, '_> {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -134,7 +144,7 @@ pub struct Pointer<'a, T> {
     _phantom: PhantomData<&'a T>,
 }
 
-impl<'a, T> Default for Pointer<'a, T> {
+impl<T> Default for Pointer<'_, T> {
     fn default() -> Self {
         Self {
             pointer: 0,
@@ -154,21 +164,36 @@ impl<T> From<T> for Pointer<'static, T> {
 
 impl<'a, T> Pointer<'a, T> {
     fn as_ref(&self) -> &'a T {
-        debug_assert!(self.pointer != 0);
+        assert!(self.pointer != 0);
         unsafe { &*(self.pointer as *const T) }
     }
 
     fn as_mut(&mut self) -> &'a mut T {
-        debug_assert!(self.pointer != 0);
+        assert!(self.pointer != 0);
         unsafe { &mut *(self.pointer as *mut T) }
     }
 }
 
+/// A pointer that owns the object it points to.
+///
+/// Note that dropping an `OwnedPointer` does not release the object.
+/// Instead, you should call [`OwnedPointer::release`] manually.
 pub type OwnedPointer<T> = Pointer<'static, T>;
 
 impl<T> OwnedPointer<T> {
-    fn drop(self) {
-        debug_assert!(self.pointer != 0);
+    /// Consume `self` and return the pointer value. Used for passing to JNI.
+    pub fn into_pointer(self) -> jlong {
+        self.pointer
+    }
+
+    /// Release the object behind the pointer.
+    fn release(self) {
+        tracing::debug!(
+            type_name = std::any::type_name::<T>(),
+            address = %format_args!("{:x}", self.pointer),
+            "release jni OwnedPointer"
+        );
+        assert!(self.pointer != 0);
         unsafe { drop(Box::from_raw(self.pointer as *mut T)) }
     }
 }
@@ -189,7 +214,7 @@ impl<'a> Deref for EnvParam<'a> {
     }
 }
 
-impl<'a> DerefMut for EnvParam<'a> {
+impl DerefMut for EnvParam<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.env
     }
@@ -201,7 +226,7 @@ impl<'a> EnvParam<'a> {
     }
 }
 
-fn execute_and_catch<'env, F, Ret>(mut env: EnvParam<'env>, inner: F) -> Ret
+pub fn execute_and_catch<'env, F, Ret>(mut env: EnvParam<'env>, inner: F) -> Ret
 where
     F: FnOnce(&mut EnvParam<'env>) -> Result<Ret>,
     Ret: Default + 'env,
@@ -244,22 +269,27 @@ struct JavaClassMethodCache {
     utc: OnceLock<GlobalRef>,
 }
 
-// TODO: may only return a RowRef
-type StreamChunkRowIterator<'a> = impl Iterator<Item = (Op, OwnedRow)> + 'a;
+mod opaque_type {
+    use super::*;
+    // TODO: may only return a RowRef
+    pub type StreamChunkRowIterator<'a> = impl Iterator<Item = (Op, OwnedRow)> + 'a;
 
-enum JavaBindingIteratorInner<'a> {
+    impl<'a> JavaBindingIteratorInner<'a> {
+        #[define_opaque(StreamChunkRowIterator)]
+        pub(super) fn from_chunk(chunk: &'a StreamChunk) -> JavaBindingIteratorInner<'a> {
+            JavaBindingIteratorInner::StreamChunk(
+                chunk
+                    .rows()
+                    .map(|(op, row)| (op.to_protobuf(), row.to_owned_row())),
+            )
+        }
+    }
+}
+pub use opaque_type::StreamChunkRowIterator;
+pub type HummockJavaBindingIterator = BoxStream<'static, anyhow::Result<(Bytes, OwnedRow)>>;
+pub enum JavaBindingIteratorInner<'a> {
     Hummock(HummockJavaBindingIterator),
     StreamChunk(StreamChunkRowIterator<'a>),
-}
-
-impl<'a> JavaBindingIteratorInner<'a> {
-    fn from_chunk(chunk: &'a StreamChunk) -> JavaBindingIteratorInner<'a> {
-        JavaBindingIteratorInner::StreamChunk(
-            chunk
-                .rows()
-                .map(|(op, row)| (op.to_protobuf(), row.to_owned_row())),
-        )
-    }
 }
 
 enum RowExtra {
@@ -288,13 +318,23 @@ struct RowCursor {
     extra: RowExtra,
 }
 
-struct JavaBindingIterator<'a> {
+pub struct JavaBindingIterator<'a> {
     inner: JavaBindingIteratorInner<'a>,
     cursor: Option<RowCursor>,
     class_cache: JavaClassMethodCache,
 }
 
-impl<'a> Deref for JavaBindingIterator<'a> {
+impl JavaBindingIterator<'static> {
+    pub fn new_hummock_iter(iter: HummockJavaBindingIterator) -> Self {
+        Self {
+            inner: JavaBindingIteratorInner::Hummock(iter),
+            cursor: None,
+            class_cache: Default::default(),
+        }
+    }
+}
+
+impl Deref for JavaBindingIterator<'_> {
     type Target = OwnedRow;
 
     fn deref(&self) -> &Self::Target {
@@ -306,31 +346,15 @@ impl<'a> Deref for JavaBindingIterator<'a> {
     }
 }
 
-#[no_mangle]
-extern "system" fn Java_com_risingwave_java_binding_Binding_vnodeCount(_env: EnvParam<'_>) -> jint {
-    VirtualNode::COUNT as jint
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_risingwave_java_binding_Binding_defaultVnodeCount(
+    _env: EnvParam<'_>,
+) -> jint {
+    VirtualNode::COUNT_FOR_COMPAT as jint
 }
 
 #[cfg_or_panic(not(madsim))]
-#[no_mangle]
-extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorNewHummock<'a>(
-    env: EnvParam<'a>,
-    read_plan: JByteArray<'a>,
-) -> Pointer<'static, JavaBindingIterator<'static>> {
-    execute_and_catch(env, move |env| {
-        let read_plan = Message::decode(to_guarded_slice(&read_plan, env)?.deref())?;
-        let iter = RUNTIME.block_on(HummockJavaBindingIterator::new(read_plan))?;
-        let iter = JavaBindingIterator {
-            inner: JavaBindingIteratorInner::Hummock(iter),
-            cursor: None,
-            class_cache: Default::default(),
-        };
-        Ok(iter.into())
-    })
-}
-
-#[cfg_or_panic(not(madsim))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorNewStreamChunk<'a>(
     env: EnvParam<'a>,
     chunk: Pointer<'a, StreamChunk>,
@@ -346,7 +370,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorNewStreamChu
 }
 
 #[cfg_or_panic(not(madsim))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorNext<'a>(
     env: EnvParam<'a>,
     mut pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -354,23 +378,22 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorNext<'a>(
     execute_and_catch(env, move |_env| {
         let iter = pointer.as_mut();
         match &mut iter.inner {
-            JavaBindingIteratorInner::Hummock(ref mut hummock_iter) => {
-                match RUNTIME.block_on(hummock_iter.next())? {
+            JavaBindingIteratorInner::Hummock(hummock_iter) => {
+                match JAVA_BINDING_ASYNC_RUNTIME.block_on(hummock_iter.try_next())? {
                     None => {
                         iter.cursor = None;
                         Ok(JNI_FALSE)
                     }
-                    Some(keyed_row) => {
-                        let (key, row) = keyed_row.into_parts();
+                    Some((key, row)) => {
                         iter.cursor = Some(RowCursor {
                             row,
-                            extra: RowExtra::Key(key.0),
+                            extra: RowExtra::Key(key),
                         });
                         Ok(JNI_TRUE)
                     }
                 }
             }
-            JavaBindingIteratorInner::StreamChunk(ref mut stream_chunk_iter) => {
+            JavaBindingIteratorInner::StreamChunk(stream_chunk_iter) => {
                 match stream_chunk_iter.next() {
                     None => {
                         iter.cursor = None;
@@ -389,15 +412,15 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorNext<'a>(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorClose<'a>(
     _env: EnvParam<'a>,
     pointer: OwnedPointer<JavaBindingIterator<'a>>,
 ) {
-    pointer.drop()
+    pointer.release()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_newStreamChunkFromPayload<'a>(
     env: EnvParam<'a>,
     stream_chunk_payload: JByteArray<'a>,
@@ -409,7 +432,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_newStreamChunkFromPa
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_newStreamChunkFromPretty<'a>(
     env: EnvParam<'a>,
     str: JString<'a>,
@@ -419,15 +442,15 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_newStreamChunkFromPr
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_streamChunkClose(
     _env: EnvParam<'_>,
     chunk: OwnedPointer<StreamChunk>,
 ) {
-    chunk.drop()
+    chunk.release()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetKey<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -446,7 +469,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetKey<'a>(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetOp<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -462,7 +485,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetOp<'a>(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorIsNull<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -473,7 +496,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorIsNull<'a>(
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetInt16Value<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -488,7 +511,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetInt16Valu
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetInt32Value<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -503,7 +526,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetInt32Valu
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetInt64Value<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -518,7 +541,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetInt64Valu
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetFloatValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -534,7 +557,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetFloatValu
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDoubleValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -550,7 +573,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDoubleVal
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetBooleanValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -561,7 +584,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetBooleanVa
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetStringValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -572,7 +595,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetStringVal
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetIntervalValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -589,7 +612,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetIntervalV
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetJsonbValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -606,7 +629,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetJsonbValu
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestampValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -659,7 +682,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestamp
             )?
             else {
                 return Err(BindingError::from(jni::errors::Error::MethodNotFound {
-                    name: "of".to_string(),
+                    name: "of".to_owned(),
                     sig: sig.into(),
                 }));
             };
@@ -668,7 +691,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestamp
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestamptzValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -709,7 +732,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestamp
             )?
             else {
                 return Err(BindingError::from(jni::errors::Error::MethodNotFound {
-                    name: "ofEpochSecond".to_string(),
+                    name: "ofEpochSecond".to_owned(),
                     sig: instant_sig.into(),
                 }));
             };
@@ -751,7 +774,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestamp
             )?
             else {
                 return Err(BindingError::from(jni::errors::Error::MethodNotFound {
-                    name: "ofInstant".to_string(),
+                    name: "ofInstant".to_owned(),
                     sig: sig.into(),
                 }));
             };
@@ -760,19 +783,27 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimestamp
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDecimalValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
     idx: jint,
 ) -> JObject<'a> {
     execute_and_catch(env, move |env: &mut EnvParam<'_>| {
-        let value = pointer
+        let decimal_value = pointer
             .as_ref()
             .datum_at(idx as usize)
             .unwrap()
-            .into_decimal()
-            .to_string();
+            .into_decimal();
+
+        match decimal_value {
+            Decimal::NaN | Decimal::NegativeInf | Decimal::PositiveInf => {
+                return Ok(JObject::null());
+            }
+            Decimal::Normalized(_) => {}
+        };
+
+        let value = decimal_value.to_string();
         let string_value = env.new_string(value)?;
         let (decimal_class_ref, constructor) = pointer
             .as_ref()
@@ -797,7 +828,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDecimalVa
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDateValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -805,7 +836,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDateValue
 ) -> JObject<'a> {
     execute_and_catch(env, move |env: &mut EnvParam<'_>| {
         let value = pointer.as_ref().datum_at(idx as usize).unwrap().into_date();
-        let epoch_days = (value.0 - NaiveDateTime::UNIX_EPOCH.date()).num_days();
+        let epoch_days = (value.0 - DateTime::UNIX_EPOCH.date_naive()).num_days();
 
         let sig = gen_jni_sig!(java.time.LocalDate ofEpochDay(long));
 
@@ -824,7 +855,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDateValue
             )?
             else {
                 return Err(BindingError::from(jni::errors::Error::MethodNotFound {
-                    name: "ofEpochDay".to_string(),
+                    name: "ofEpochDay".to_owned(),
                     sig: sig.into(),
                 }));
             };
@@ -833,7 +864,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetDateValue
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimeValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -872,7 +903,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimeValue
             )?
             else {
                 return Err(BindingError::from(jni::errors::Error::MethodNotFound {
-                    name: "of".to_string(),
+                    name: "of".to_owned(),
                     sig: sig.into(),
                 }));
             };
@@ -881,7 +912,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetTimeValue
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetByteaValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -897,7 +928,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetByteaValu
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_iteratorGetArrayValue<'a>(
     env: EnvParam<'a>,
     pointer: Pointer<'a, JavaBindingIterator<'a>>,
@@ -985,7 +1016,7 @@ pub type JniReceiverType<T> = Receiver<T>;
 /// If msg is null, just check whether the channel is closed.
 /// Return true if sending is successful, otherwise, return false so that caller can stop
 /// gracefully.
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_sendCdcSourceMsgToChannel<'a>(
     env: EnvParam<'a>,
     channel: Pointer<'a, JniSenderType<GetEventStreamResponse>>,
@@ -1017,7 +1048,7 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_sendCdcSourceMsgToCh
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "system" fn Java_com_risingwave_java_binding_Binding_sendCdcSourceErrorToChannel<'a>(
     env: EnvParam<'a>,
     channel: Pointer<'a, JniSenderType<GetEventStreamResponse>>,
@@ -1049,6 +1080,14 @@ extern "system" fn Java_com_risingwave_java_binding_Binding_sendCdcSourceErrorTo
     })
 }
 
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_risingwave_java_binding_Binding_cdcSourceSenderClose(
+    _env: EnvParam<'_>,
+    channel: OwnedPointer<JniSenderType<GetEventStreamResponse>>,
+) {
+    channel.release();
+}
+
 pub enum JniSinkWriterStreamRequest {
     PbRequest(SinkWriterStreamRequest),
     Chunk {
@@ -1064,7 +1103,7 @@ impl From<SinkWriterStreamRequest> for JniSinkWriterStreamRequest {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_risingwave_java_binding_Binding_recvSinkWriterRequestFromChannel<
     'a,
 >(
@@ -1076,11 +1115,12 @@ pub extern "system" fn Java_com_risingwave_java_binding_Binding_recvSinkWriterRe
             let obj = match msg {
                 JniSinkWriterStreamRequest::PbRequest(request) => {
                     let bytes = env.byte_array_from_slice(&Message::encode_to_vec(&request))?;
+                    let jobj = JObject::from(bytes);
                     call_static_method!(
                         env,
                         {com.risingwave.java.binding.JniSinkWriterStreamRequest},
                         {com.risingwave.java.binding.JniSinkWriterStreamRequest fromSerializedPayload(byte[] payload)},
-                        &JObject::from(bytes)
+                        &jobj
                     )?
                 }
                 JniSinkWriterStreamRequest::Chunk {
@@ -1107,7 +1147,7 @@ pub extern "system" fn Java_com_risingwave_java_binding_Binding_recvSinkWriterRe
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_risingwave_java_binding_Binding_sendSinkWriterResponseToChannel<
     'a,
 >(
@@ -1132,7 +1172,7 @@ pub extern "system" fn Java_com_risingwave_java_binding_Binding_sendSinkWriterRe
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_risingwave_java_binding_Binding_sendSinkWriterErrorToChannel<'a>(
     env: EnvParam<'a>,
     channel: Pointer<'a, Sender<anyhow::Result<SinkWriterStreamResponse>>>,
@@ -1164,7 +1204,7 @@ pub extern "system" fn Java_com_risingwave_java_binding_Binding_sendSinkWriterEr
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_risingwave_java_binding_Binding_recvSinkCoordinatorRequestFromChannel<
     'a,
 >(
@@ -1182,7 +1222,7 @@ pub extern "system" fn Java_com_risingwave_java_binding_Binding_recvSinkCoordina
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_risingwave_java_binding_Binding_sendSinkCoordinatorResponseToChannel<
     'a,
 >(

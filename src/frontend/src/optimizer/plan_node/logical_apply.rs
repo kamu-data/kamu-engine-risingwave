@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,12 @@ use risingwave_common::catalog::Schema;
 use risingwave_pb::plan_common::JoinType;
 
 use super::generic::{
-    self, push_down_into_join, push_down_join_condition, GenericPlanNode, GenericPlanRef,
+    self, GenericPlanNode, GenericPlanRef, push_down_into_join, push_down_join_condition,
 };
-use super::utils::{childless_record, Distill};
+use super::utils::{Distill, childless_record};
 use super::{
-    ColPrunable, Logical, LogicalJoin, LogicalProject, PlanBase, PlanRef, PlanTreeNodeBinary,
-    PredicatePushdown, ToBatch, ToStream,
+    BatchPlanRef, ColPrunable, Logical, LogicalJoin, LogicalPlanRef as PlanRef, LogicalProject,
+    PlanBase, PlanTreeNodeBinary, PredicatePushdown, StreamPlanRef, ToBatch, ToStream,
 };
 use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{CorrelatedId, Expr, ExprImpl, ExprRewriter, ExprVisitor, InputRef};
@@ -53,6 +53,10 @@ pub struct LogicalApply {
     /// Whether we require the subquery to produce at most one row. If `true`, we have to report an
     /// error if the subquery produces more than one row.
     max_one_row: bool,
+
+    /// An apply has been translated by `translate_apply()`, so we should not translate it in `translate_apply_rule` again.
+    /// This flag is used to avoid infinite loop in General Unnesting(Translate Apply), since we use a top-down apply order instead of bottom-up to improve the multi-scalar subqueries optimization time.
+    translated: bool,
 }
 
 impl Distill for LogicalApply {
@@ -85,6 +89,7 @@ impl LogicalApply {
         correlated_id: CorrelatedId,
         correlated_indices: Vec<usize>,
         max_one_row: bool,
+        translated: bool,
     ) -> Self {
         let ctx = left.ctx();
         let join_core = generic::Join::with_full_output(left, right, join_type, on);
@@ -105,6 +110,7 @@ impl LogicalApply {
             correlated_id,
             correlated_indices,
             max_one_row,
+            translated,
         }
     }
 
@@ -125,6 +131,7 @@ impl LogicalApply {
             correlated_id,
             correlated_indices,
             max_one_row,
+            false,
         )
         .into()
     }
@@ -161,7 +168,15 @@ impl LogicalApply {
     }
 
     pub fn correlated_indices(&self) -> Vec<usize> {
-        self.correlated_indices.to_owned()
+        self.correlated_indices.clone()
+    }
+
+    pub fn on_condition(&self) -> &Condition {
+        &self.on
+    }
+
+    pub fn translated(&self) -> bool {
+        self.translated
     }
 
     pub fn max_one_row(&self) -> bool {
@@ -202,7 +217,7 @@ impl LogicalApply {
         let apply_left_len = apply_left.schema().len();
         let correlated_indices_len = correlated_indices.len();
 
-        let new_apply = LogicalApply::create(
+        let new_apply = LogicalApply::new(
             domain,
             apply_right,
             JoinType::Inner,
@@ -210,7 +225,9 @@ impl LogicalApply {
             correlated_id,
             correlated_indices,
             max_one_row,
-        );
+            true,
+        )
+        .into();
 
         let on = Self::rewrite_on(on, correlated_indices_len, apply_left_len).and(Condition {
             conjunctions: eq_predicates,
@@ -267,7 +284,7 @@ impl LogicalApply {
     }
 }
 
-impl PlanTreeNodeBinary for LogicalApply {
+impl PlanTreeNodeBinary<Logical> for LogicalApply {
     fn left(&self) -> PlanRef {
         self.left.clone()
     }
@@ -285,11 +302,12 @@ impl PlanTreeNodeBinary for LogicalApply {
             self.correlated_id,
             self.correlated_indices.clone(),
             self.max_one_row,
+            self.translated,
         )
     }
 }
 
-impl_plan_tree_node_for_binary! { LogicalApply }
+impl_plan_tree_node_for_binary! { Logical, LogicalApply }
 
 impl ColPrunable for LogicalApply {
     fn prune_col(&self, _required_cols: &[usize], _ctx: &mut ColumnPruningContext) -> PlanRef {
@@ -297,7 +315,7 @@ impl ColPrunable for LogicalApply {
     }
 }
 
-impl ExprRewritable for LogicalApply {
+impl ExprRewritable<Logical> for LogicalApply {
     fn has_rewritable_expr(&self) -> bool {
         true
     }
@@ -353,17 +371,17 @@ impl PredicatePushdown for LogicalApply {
 }
 
 impl ToBatch for LogicalApply {
-    fn to_batch(&self) -> Result<PlanRef> {
+    fn to_batch(&self) -> Result<BatchPlanRef> {
         Err(RwError::from(ErrorCode::InternalError(
-            "LogicalApply should be unnested".to_string(),
+            "LogicalApply should be unnested".to_owned(),
         )))
     }
 }
 
 impl ToStream for LogicalApply {
-    fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<PlanRef> {
+    fn to_stream(&self, _ctx: &mut ToStreamContext) -> Result<StreamPlanRef> {
         Err(RwError::from(ErrorCode::InternalError(
-            "LogicalApply should be unnested".to_string(),
+            "LogicalApply should be unnested".to_owned(),
         )))
     }
 
@@ -372,7 +390,7 @@ impl ToStream for LogicalApply {
         _ctx: &mut RewriteStreamContext,
     ) -> Result<(PlanRef, ColIndexMapping)> {
         Err(RwError::from(ErrorCode::InternalError(
-            "LogicalApply should be unnested".to_string(),
+            "LogicalApply should be unnested".to_owned(),
         )))
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,29 @@
 use std::error::Error;
 
 use bytes::BytesMut;
-use postgres_types::{accepts, to_sql_checked, IsNull, ToSql, Type};
+use postgres_types::{IsNull, ToSql, Type, to_sql_checked};
+use risingwave_common::types::ScalarRefImpl;
 
-use crate::types::{JsonbRef, ScalarRefImpl};
+use crate::types::ScalarImpl;
+
+impl ToSql for ScalarImpl {
+    to_sql_checked!();
+
+    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>>
+    where
+        Self: Sized,
+    {
+        self.as_scalar_ref_impl().to_sql(ty, out)
+    }
+
+    // return true to accept all types
+    fn accepts(_ty: &Type) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+}
 
 impl ToSql for ScalarRefImpl<'_> {
     to_sql_checked!();
@@ -41,13 +61,15 @@ impl ToSql for ScalarRefImpl<'_> {
             ScalarRefImpl::Timestamp(v) => v.to_sql(ty, out),
             ScalarRefImpl::Timestamptz(v) => v.to_sql(ty, out),
             ScalarRefImpl::Time(v) => v.to_sql(ty, out),
-            ScalarRefImpl::Bytea(v) => v.to_sql(ty, out),
-            ScalarRefImpl::Jsonb(_) // jsonbb::Value doesn't implement ToSql yet
+            ScalarRefImpl::Bytea(v) => (&**v).to_sql(ty, out),
+            ScalarRefImpl::Jsonb(v) => v.to_sql(ty, out),
+            ScalarRefImpl::Vector(_)
             | ScalarRefImpl::Int256(_)
             | ScalarRefImpl::Struct(_)
             | ScalarRefImpl::List(_) => {
                 bail_not_implemented!("the postgres encoding for {ty} is unsupported")
             }
+            ScalarRefImpl::Map(_) => todo!(),
         }
     }
 
@@ -57,20 +79,5 @@ impl ToSql for ScalarRefImpl<'_> {
         Self: Sized,
     {
         true
-    }
-}
-
-impl ToSql for JsonbRef<'_> {
-    accepts!(JSONB);
-
-    to_sql_checked!();
-
-    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>>
-    where
-        Self: Sized,
-    {
-        let buf = self.value_serialize();
-        out.extend(buf);
-        Ok(IsNull::No)
     }
 }

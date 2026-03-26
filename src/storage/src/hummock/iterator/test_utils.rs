@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,22 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::Iterator;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use foyer::{CacheBuilder, HybridCacheBuilder};
 use itertools::Itertools;
 use risingwave_common::catalog::TableId;
-use risingwave_common::config::{EvictionConfig, MetricLevel, ObjectStoreConfig};
+use risingwave_common::config::{MetricLevel, ObjectStoreConfig};
 use risingwave_common::hash::VirtualNode;
 use risingwave_common::util::epoch::test_epoch;
-use risingwave_hummock_sdk::key::{prefix_slice_with_vnode, FullKey, TableKey, UserKey};
-use risingwave_hummock_sdk::{EpochWithGap, HummockEpoch, HummockSstableObjectId};
+use risingwave_hummock_sdk::key::{FullKey, TableKey, UserKey, prefix_slice_with_vnode};
+use risingwave_hummock_sdk::sstable_info::SstableInfo;
+use risingwave_hummock_sdk::{EpochWithGap, HummockEpoch};
 use risingwave_object_store::object::{
     InMemObjectStore, ObjectStore, ObjectStoreImpl, ObjectStoreRef,
 };
-use risingwave_pb::hummock::SstableInfo;
 
+use crate::hummock::none::NoneRecentFilter;
+use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferValue;
 use crate::hummock::sstable::SstableIteratorReadOptions;
 use crate::hummock::sstable_store::SstableStore;
 pub use crate::hummock::test_utils::default_builder_opt_for_test;
@@ -35,10 +37,10 @@ use crate::hummock::test_utils::{
     gen_test_sstable, gen_test_sstable_info, gen_test_sstable_with_range_tombstone,
 };
 use crate::hummock::{
-    FileCache, HummockValue, SstableBuilderOptions, SstableIterator, SstableIteratorType,
-    SstableStoreConfig, SstableStoreRef, TableHolder,
+    HummockValue, SstableBuilderOptions, SstableIterator, SstableIteratorType, SstableStoreConfig,
+    SstableStoreRef, TableHolder,
 };
-use crate::monitor::{global_hummock_state_store_metrics, ObjectStoreMetrics};
+use crate::monitor::{ObjectStoreMetrics, global_hummock_state_store_metrics};
 
 /// `assert_eq` two `Vec<u8>` with human-readable format.
 #[macro_export]
@@ -54,33 +56,48 @@ macro_rules! assert_bytes_eq {
 
 pub const TEST_KEYS_COUNT: usize = 10;
 
-pub fn mock_sstable_store() -> SstableStoreRef {
+pub async fn mock_sstable_store() -> SstableStoreRef {
     mock_sstable_store_with_object_store(Arc::new(ObjectStoreImpl::InMem(
-        InMemObjectStore::new().monitored(
+        InMemObjectStore::for_test().monitored(
             Arc::new(ObjectStoreMetrics::unused()),
-            ObjectStoreConfig::default(),
+            Arc::new(ObjectStoreConfig::default()),
         ),
     )))
+    .await
 }
 
-pub fn mock_sstable_store_with_object_store(store: ObjectStoreRef) -> SstableStoreRef {
-    let path = "test".to_string();
+pub async fn mock_sstable_store_with_object_store(store: ObjectStoreRef) -> SstableStoreRef {
+    let path = "test".to_owned();
+    let meta_cache = HybridCacheBuilder::new()
+        .memory(64 << 20)
+        .with_shards(2)
+        .storage()
+        .build()
+        .await
+        .unwrap();
+    let block_cache = HybridCacheBuilder::new()
+        .memory(64 << 20)
+        .with_shards(2)
+        .storage()
+        .build()
+        .await
+        .unwrap();
     Arc::new(SstableStore::new(SstableStoreConfig {
         store,
         path,
-        block_cache_capacity: 64 << 20,
-        block_cache_shard_num: 2,
-        block_cache_eviction: EvictionConfig::for_test(),
-        meta_cache_capacity: 64 << 20,
-        meta_cache_shard_num: 2,
-        meta_cache_eviction: EvictionConfig::for_test(),
+
         prefetch_buffer_capacity: 64 << 20,
         max_prefetch_block_number: 16,
 
-        data_file_cache: FileCache::none(),
-        meta_file_cache: FileCache::none(),
-        recent_filter: None,
+        recent_filter: Arc::new(NoneRecentFilter::default().into()),
         state_store_metrics: Arc::new(global_hummock_state_store_metrics(MetricLevel::Disabled)),
+        use_new_object_prefix_strategy: true,
+        skip_bloom_filter_in_serde: false,
+
+        meta_cache,
+        block_cache,
+        vector_meta_cache: CacheBuilder::new(64 << 20).build(),
+        vector_block_cache: CacheBuilder::new(64 << 20).build(),
     }))
 }
 
@@ -132,8 +149,8 @@ pub fn iterator_test_value_of(idx: usize) -> Vec<u8> {
 }
 
 pub fn transform_shared_buffer(
-    batches: Vec<(Vec<u8>, HummockValue<Bytes>)>,
-) -> Vec<(TableKey<Bytes>, HummockValue<Bytes>)> {
+    batches: Vec<(Vec<u8>, SharedBufferValue<Bytes>)>,
+) -> Vec<(TableKey<Bytes>, SharedBufferValue<Bytes>)> {
     batches
         .into_iter()
         .map(|(k, v)| (TableKey(k.into()), v))
@@ -144,7 +161,7 @@ pub fn transform_shared_buffer(
 /// correctness of their implementations by comparing the got value and the expected value
 /// generated by `test_key_of` and `test_value_of`.
 pub async fn gen_iterator_test_sstable_info(
-    object_id: HummockSstableObjectId,
+    object_id: u64,
     opts: SstableBuilderOptions,
     idx_mapping: impl Fn(usize) -> usize,
     sstable_store: SstableStoreRef,
@@ -168,12 +185,12 @@ pub async fn gen_iterator_test_sstable_info(
 /// correctness of their implementations by comparing the got value and the expected value
 /// generated by `test_key_of` and `test_value_of`.
 pub async fn gen_iterator_test_sstable_base(
-    object_id: HummockSstableObjectId,
+    object_id: u64,
     opts: SstableBuilderOptions,
     idx_mapping: impl Fn(usize) -> usize,
     sstable_store: SstableStoreRef,
     total: usize,
-) -> TableHolder {
+) -> (TableHolder, SstableInfo) {
     gen_test_sstable(
         opts,
         object_id,
@@ -190,10 +207,10 @@ pub async fn gen_iterator_test_sstable_base(
 
 // key=[idx, epoch], value
 pub async fn gen_iterator_test_sstable_from_kv_pair(
-    object_id: HummockSstableObjectId,
+    object_id: u64,
     kv_pairs: Vec<(usize, u64, HummockValue<Vec<u8>>)>,
     sstable_store: SstableStoreRef,
-) -> TableHolder {
+) -> (TableHolder, SstableInfo) {
     gen_test_sstable(
         default_builder_opt_for_test(),
         object_id,
@@ -207,7 +224,7 @@ pub async fn gen_iterator_test_sstable_from_kv_pair(
 
 // key=[idx, epoch], value
 pub async fn gen_iterator_test_sstable_with_range_tombstones(
-    object_id: HummockSstableObjectId,
+    object_id: u64,
     kv_pairs: Vec<(usize, u64, HummockValue<Vec<u8>>)>,
     sstable_store: SstableStoreRef,
 ) -> SstableInfo {
@@ -226,11 +243,11 @@ pub async fn gen_merge_iterator_interleave_test_sstable_iters(
     key_count: usize,
     count: usize,
 ) -> Vec<SstableIterator> {
-    let sstable_store = mock_sstable_store();
+    let sstable_store = mock_sstable_store().await;
     let mut result = vec![];
     for i in 0..count {
-        let table = gen_iterator_test_sstable_base(
-            i as HummockSstableObjectId,
+        let (table, sstable_info) = gen_iterator_test_sstable_base(
+            i as u64,
             default_builder_opt_for_test(),
             |x| x * count + i,
             sstable_store.clone(),
@@ -241,19 +258,20 @@ pub async fn gen_merge_iterator_interleave_test_sstable_iters(
             table,
             sstable_store.clone(),
             Arc::new(SstableIteratorReadOptions::default()),
+            &sstable_info,
         ));
     }
     result
 }
 
 pub async fn gen_iterator_test_sstable_with_incr_epoch(
-    object_id: HummockSstableObjectId,
+    object_id: u64,
     opts: SstableBuilderOptions,
     idx_mapping: impl Fn(usize) -> usize,
     sstable_store: SstableStoreRef,
     total: usize,
     epoch_base: u64,
-) -> TableHolder {
+) -> (TableHolder, SstableInfo) {
     gen_test_sstable(
         opts,
         object_id,

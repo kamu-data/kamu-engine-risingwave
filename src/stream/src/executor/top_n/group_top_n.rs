@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,29 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 
-use risingwave_common::array::{Op, StreamChunk};
-use risingwave_common::buffer::Bitmap;
-use risingwave_common::catalog::Schema;
+use risingwave_common::array::Op;
 use risingwave_common::hash::HashKey;
-use risingwave_common::row::RowExt;
+use risingwave_common::row::{RowDeserializer, RowExt};
 use risingwave_common::util::epoch::EpochPair;
 use risingwave_common::util::iter_util::ZipEqDebug;
 use risingwave_common::util::sort_util::ColumnOrder;
-use risingwave_storage::StateStore;
 
 use super::top_n_cache::TopNCacheTrait;
 use super::utils::*;
 use super::{ManagedTopNState, TopNCache};
-use crate::cache::{new_unbounded, ManagedLruCache};
+use crate::cache::ManagedLruCache;
 use crate::common::metrics::MetricsInfo;
-use crate::common::table::state_table::StateTable;
-use crate::error::StreamResult;
-use crate::executor::error::StreamExecutorResult;
-use crate::executor::{ActorContextRef, Executor, PkIndices, Watermark};
-use crate::task::AtomicU64Ref;
+use crate::common::table::state_table::StateTablePostCommit;
+use crate::executor::monitor::GroupTopNMetrics;
+use crate::executor::prelude::*;
+use crate::executor::top_n::top_n_cache::TopNStaging;
 
 pub type GroupTopNExecutor<K, S, const WITH_TIES: bool> =
     TopNExecutorWrapper<InnerGroupTopNExecutor<K, S, WITH_TIES>>;
@@ -52,20 +48,17 @@ impl<K: HashKey, S: StateStore, const WITH_TIES: bool> GroupTopNExecutor<K, S, W
         state_table: StateTable<S>,
         watermark_epoch: AtomicU64Ref,
     ) -> StreamResult<Self> {
-        Ok(TopNExecutorWrapper {
-            input,
-            ctx: ctx.clone(),
-            inner: InnerGroupTopNExecutor::new(
-                schema,
-                storage_key,
-                offset_and_limit,
-                order_by,
-                group_by,
-                state_table,
-                watermark_epoch,
-                ctx,
-            )?,
-        })
+        let inner = InnerGroupTopNExecutor::new(
+            schema,
+            storage_key,
+            offset_and_limit,
+            order_by,
+            group_by,
+            state_table,
+            watermark_epoch,
+            &ctx,
+        )?;
+        Ok(TopNExecutorWrapper { input, ctx, inner })
     }
 }
 
@@ -79,7 +72,7 @@ pub struct InnerGroupTopNExecutor<K: HashKey, S: StateStore, const WITH_TIES: bo
     offset: usize,
 
     /// The storage key indices of the `GroupTopNExecutor`
-    storage_key_indices: PkIndices,
+    storage_key_indices: Vec<usize>,
 
     managed_state: ManagedTopNState<S>,
 
@@ -92,7 +85,10 @@ pub struct InnerGroupTopNExecutor<K: HashKey, S: StateStore, const WITH_TIES: bo
     /// Used for serializing pk into `CacheKey`.
     cache_key_serde: CacheKeySerde,
 
-    ctx: ActorContextRef,
+    /// Minimum cache capacity per group from config
+    topn_cache_min_capacity: usize,
+
+    metrics: GroupTopNMetrics,
 }
 
 impl<K: HashKey, S: StateStore, const WITH_TIES: bool> InnerGroupTopNExecutor<K, S, WITH_TIES> {
@@ -105,13 +101,18 @@ impl<K: HashKey, S: StateStore, const WITH_TIES: bool> InnerGroupTopNExecutor<K,
         group_by: Vec<usize>,
         state_table: StateTable<S>,
         watermark_epoch: AtomicU64Ref,
-        ctx: ActorContextRef,
+        ctx: &ActorContext,
     ) -> StreamResult<Self> {
         let metrics_info = MetricsInfo::new(
             ctx.streaming_metrics.clone(),
             state_table.table_id(),
             ctx.id,
             "GroupTopN",
+        );
+        let metrics = ctx.streaming_metrics.new_group_top_n_metrics(
+            state_table.table_id(),
+            ctx.id,
+            ctx.fragment_id,
         );
 
         let cache_key_serde = create_cache_key_serde(&storage_key, &schema, &order_by, &group_by);
@@ -126,7 +127,8 @@ impl<K: HashKey, S: StateStore, const WITH_TIES: bool> InnerGroupTopNExecutor<K,
             group_by,
             caches: GroupTopNCache::new(watermark_epoch, metrics_info),
             cache_key_serde,
-            ctx,
+            topn_cache_min_capacity: ctx.config.developer.topn_cache_min_capacity,
+            metrics,
         })
     }
 }
@@ -136,8 +138,8 @@ pub struct GroupTopNCache<K: HashKey, const WITH_TIES: bool> {
 }
 
 impl<K: HashKey, const WITH_TIES: bool> GroupTopNCache<K, WITH_TIES> {
-    pub fn new(watermark_epoch: AtomicU64Ref, metrics_info: MetricsInfo) -> Self {
-        let cache = new_unbounded(watermark_epoch, metrics_info);
+    pub fn new(watermark_sequence: AtomicU64Ref, metrics_info: MetricsInfo) -> Self {
+        let cache = ManagedLruCache::unbounded(watermark_sequence, metrics_info);
         Self { data: cache }
     }
 }
@@ -161,50 +163,50 @@ impl<K: HashKey, S: StateStore, const WITH_TIES: bool> TopNExecutorBase
 where
     TopNCache<WITH_TIES>: TopNCacheTrait,
 {
-    async fn apply_chunk(&mut self, chunk: StreamChunk) -> StreamExecutorResult<StreamChunk> {
-        let mut res_ops = Vec::with_capacity(self.limit);
-        let mut res_rows = Vec::with_capacity(self.limit);
+    type State = S;
+
+    async fn apply_chunk(
+        &mut self,
+        chunk: StreamChunk,
+    ) -> StreamExecutorResult<Option<StreamChunk>> {
         let keys = K::build_many(&self.group_by, chunk.data_chunk());
-        let table_id_str = self.managed_state.table().table_id().to_string();
-        let actor_id_str = self.ctx.id.to_string();
-        let fragment_id_str = self.ctx.fragment_id.to_string();
+        let mut stagings: HashMap<K, TopNStaging> = HashMap::new();
+
         for (r, group_cache_key) in chunk.rows_with_holes().zip_eq_debug(keys.iter()) {
             let Some((op, row_ref)) = r else {
                 continue;
             };
+
             // The pk without group by
             let pk_row = row_ref.project(&self.storage_key_indices[self.group_by.len()..]);
             let cache_key = serialize_pk_to_cache_key(pk_row, &self.cache_key_serde);
 
             let group_key = row_ref.project(&self.group_by);
-            self.ctx
-                .streaming_metrics
-                .group_top_n_total_query_cache_count
-                .with_label_values(&[&table_id_str, &actor_id_str, &fragment_id_str])
-                .inc();
+            self.metrics.group_top_n_total_query_cache_count.inc();
             // If 'self.caches' does not already have a cache for the current group, create a new
             // cache for it and insert it into `self.caches`
             if !self.caches.contains(group_cache_key) {
-                self.ctx
-                    .streaming_metrics
-                    .group_top_n_cache_miss_count
-                    .with_label_values(&[&table_id_str, &actor_id_str, &fragment_id_str])
-                    .inc();
-                let mut topn_cache =
-                    TopNCache::new(self.offset, self.limit, self.schema.data_types());
+                self.metrics.group_top_n_cache_miss_count.inc();
+                let mut topn_cache = TopNCache::with_min_capacity(
+                    self.offset,
+                    self.limit,
+                    self.schema.data_types(),
+                    self.topn_cache_min_capacity,
+                );
                 self.managed_state
                     .init_topn_cache(Some(group_key), &mut topn_cache)
                     .await?;
-                self.caches.push(group_cache_key.clone(), topn_cache);
+                self.caches.put(group_cache_key.clone(), topn_cache);
             }
 
             let mut cache = self.caches.get_mut(group_cache_key).unwrap();
+            let staging = stagings.entry(group_cache_key.clone()).or_default();
 
             // apply the chunk to state table
             match op {
                 Op::Insert | Op::UpdateInsert => {
                     self.managed_state.insert(row_ref);
-                    cache.insert(cache_key, row_ref, &mut res_ops, &mut res_rows);
+                    cache.insert(cache_key, row_ref, staging);
                 }
 
                 Op::Delete | Op::UpdateDelete => {
@@ -215,22 +217,33 @@ where
                             &mut self.managed_state,
                             cache_key,
                             row_ref,
-                            &mut res_ops,
-                            &mut res_rows,
+                            staging,
                         )
                         .await?;
                 }
             }
         }
-        self.ctx
-            .streaming_metrics
+
+        self.metrics
             .group_top_n_cached_entry_count
-            .with_label_values(&[&table_id_str, &actor_id_str, &fragment_id_str])
             .set(self.caches.len() as i64);
-        generate_output(res_rows, res_ops, &self.schema)
+
+        let data_types = self.schema.data_types();
+        let deserializer = RowDeserializer::new(data_types.clone());
+        let mut chunk_builder = StreamChunkBuilder::unlimited(data_types, Some(chunk.capacity()));
+        for staging in stagings.into_values() {
+            for res in staging.into_deserialized_changes(&deserializer) {
+                let record = res?;
+                let _none = chunk_builder.append_record(record);
+            }
+        }
+        Ok(chunk_builder.take())
     }
 
-    async fn flush_data(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
+    async fn flush_data(
+        &mut self,
+        epoch: EpochPair,
+    ) -> StreamExecutorResult<StateTablePostCommit<'_, S>> {
         self.managed_state.flush(epoch).await
     }
 
@@ -238,15 +251,8 @@ where
         self.managed_state.try_flush().await
     }
 
-    fn update_epoch(&mut self, epoch: u64) {
-        self.caches.update_epoch(epoch);
-    }
-
-    fn update_vnode_bitmap(&mut self, vnode_bitmap: Arc<Bitmap>) {
-        let cache_may_stale = self.managed_state.update_vnode_bitmap(vnode_bitmap);
-        if cache_may_stale {
-            self.caches.clear();
-        }
+    fn clear_cache(&mut self) {
+        self.caches.clear();
     }
 
     fn evict(&mut self) {
@@ -254,14 +260,12 @@ where
     }
 
     async fn init(&mut self, epoch: EpochPair) -> StreamExecutorResult<()> {
-        self.managed_state.init_epoch(epoch);
-        Ok(())
+        self.managed_state.init_epoch(epoch).await
     }
 
     async fn handle_watermark(&mut self, watermark: Watermark) -> Option<Watermark> {
         if watermark.col_idx == self.group_by[0] {
-            self.managed_state
-                .update_watermark(watermark.val.clone(), false);
+            self.managed_state.update_watermark(watermark.val.clone());
             Some(watermark)
         } else {
             None
@@ -273,20 +277,16 @@ where
 mod tests {
     use std::sync::atomic::AtomicU64;
 
-    use assert_matches::assert_matches;
-    use futures::StreamExt;
     use risingwave_common::array::stream_chunk::StreamChunkTestExt;
-    use risingwave_common::catalog::{Field, Schema};
+    use risingwave_common::catalog::Field;
     use risingwave_common::hash::SerializedKey;
-    use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::sort_util::OrderType;
     use risingwave_storage::memory::MemoryStateStore;
 
     use super::*;
     use crate::executor::test_utils::top_n_executor::create_in_memory_state_table;
-    use crate::executor::test_utils::MockSource;
-    use crate::executor::{ActorContext, Barrier, Execute, Message};
+    use crate::executor::test_utils::{MockSource, StreamExecutorTestExt};
 
     fn create_schema() -> Schema {
         Schema {
@@ -316,7 +316,7 @@ mod tests {
         vec![ColumnOrder::new(0, OrderType::ascending())]
     }
 
-    fn pk_indices() -> PkIndices {
+    fn stream_key() -> StreamKey {
         vec![1, 2, 0]
     }
 
@@ -366,7 +366,7 @@ mod tests {
             Message::Chunk(std::mem::take(&mut chunks[3])),
             Message::Barrier(Barrier::new_test_barrier(test_epoch(5))),
         ])
-        .into_executor(schema, pk_indices())
+        .into_executor(schema, stream_key())
     }
 
     #[tokio::test]
@@ -379,11 +379,11 @@ mod tests {
                 OrderType::ascending(),
                 OrderType::ascending(),
             ],
-            &pk_indices(),
+            &stream_key(),
         )
         .await;
         let schema = source.schema().clone();
-        let top_n_executor = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
+        let top_n = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
             source,
             ActorContext::for_test(0),
             schema,
@@ -395,14 +395,13 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap();
-        let mut top_n_executor = top_n_executor.boxed().execute();
+        let mut top_n = top_n.boxed().execute();
 
         // consume the init barrier
-        top_n_executor.next().await.unwrap().unwrap();
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 + 10 9 1
                 +  8 8 2
@@ -410,58 +409,50 @@ mod tests {
                 +  9 1 1
                 + 10 1 1
                 ",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 - 10 9 1
                 -  8 8 2
                 - 10 1 1
                 +  8 1 3
                 ",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 " I I I
                 - 7 8 2
                 - 8 1 3
                 - 9 1 1
                 ",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 " I I I
                 + 5 1 1
                 + 2 1 1
                 ",
-            ),
+            )
+            .sort_rows(),
         );
     }
 
@@ -475,11 +466,11 @@ mod tests {
                 OrderType::ascending(),
                 OrderType::ascending(),
             ],
-            &pk_indices(),
+            &stream_key(),
         )
         .await;
         let schema = source.schema().clone();
-        let top_n_executor = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
+        let top_n = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
             source,
             ActorContext::for_test(0),
             schema,
@@ -491,66 +482,57 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap();
-        let mut top_n_executor = top_n_executor.boxed().execute();
+        let mut top_n = top_n.boxed().execute();
 
         // consume the init barrier
-        top_n_executor.next().await.unwrap().unwrap();
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 +  8 8 2
                 + 10 1 1
                 +  8 1 3
                 ",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 -  8 8 2
                 - 10 1 1
                 ",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 " I I I
                 - 8 1 3",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 " I I I
                 + 5 1 1
                 + 3 1 2
                 ",
-            ),
+            )
+            .sort_rows(),
         );
     }
 
@@ -564,11 +546,11 @@ mod tests {
                 OrderType::ascending(),
                 OrderType::ascending(),
             ],
-            &pk_indices(),
+            &stream_key(),
         )
         .await;
         let schema = source.schema().clone();
-        let top_n_executor = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
+        let top_n = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
             source,
             ActorContext::for_test(0),
             schema,
@@ -580,14 +562,13 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         )
         .unwrap();
-        let mut top_n_executor = top_n_executor.boxed().execute();
+        let mut top_n = top_n.boxed().execute();
 
         // consume the init barrier
-        top_n_executor.next().await.unwrap().unwrap();
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 + 10 9 1
                 +  8 8 2
@@ -595,56 +576,148 @@ mod tests {
                 +  9 1 1
                 + 10 1 1
                 +  8 1 3",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 - 10 9 1
                 -  8 8 2
                 - 10 1 1",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 - 7 8 2
                 - 8 1 3
                 - 9 1 1",
-            ),
+            )
+            .sort_rows(),
         );
 
         // barrier
-        assert_matches!(
-            top_n_executor.next().await.unwrap().unwrap(),
-            Message::Barrier(_)
-        );
-        let res = top_n_executor.next().await.unwrap().unwrap();
+        top_n.expect_barrier().await;
         assert_eq!(
-            res.as_chunk().unwrap(),
-            &StreamChunk::from_pretty(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
                 "  I I I
                 +  5 1 1
                 +  2 1 1
                 +  3 1 2
                 +  4 1 3",
-            ),
+            )
+            .sort_rows(),
         );
+    }
+
+    #[tokio::test]
+    async fn test_compact_changes() {
+        let schema = create_schema();
+        let source = MockSource::with_messages(vec![
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(1))),
+            Message::Chunk(StreamChunk::from_pretty(
+                "  I I I
+                +  0 0 9
+                +  0 0 8
+                +  0 0 7
+                +  0 0 6
+                +  0 1 15
+                +  0 1 14",
+            )),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(2))),
+            Message::Chunk(StreamChunk::from_pretty(
+                "  I I I
+                -  0 0 6
+                -  0 0 8
+                +  0 0 4
+                +  0 0 3
+                +  0 1 12
+                +  0 2 26
+                -  0 1 12
+                +  0 1 11",
+            )),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(3))),
+            Message::Chunk(StreamChunk::from_pretty(
+                "  I I I
+                +  0 0 11", // this should result in no chunk output
+            )),
+            Message::Barrier(Barrier::new_test_barrier(test_epoch(4))),
+        ])
+        .into_executor(schema.clone(), vec![2]);
+
+        let state_table = create_in_memory_state_table(
+            &schema.data_types(),
+            &[
+                OrderType::ascending(),
+                OrderType::ascending(),
+                OrderType::ascending(),
+            ],
+            &[0, 1, 2], // table pk = group key (0, 1) + order key (2) + additional pk (empty)
+        )
+        .await;
+
+        let top_n = GroupTopNExecutor::<SerializedKey, MemoryStateStore, false>::new(
+            source,
+            ActorContext::for_test(0),
+            schema,
+            vec![
+                ColumnOrder::new(0, OrderType::ascending()),
+                ColumnOrder::new(1, OrderType::ascending()),
+                ColumnOrder::new(2, OrderType::ascending()),
+            ],
+            (0, 2), // (offset, limit)
+            vec![ColumnOrder::new(2, OrderType::ascending())],
+            vec![0, 1],
+            state_table,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap();
+        let mut top_n = top_n.boxed().execute();
+
+        // initial barrier
+        top_n.expect_barrier().await;
+
+        assert_eq!(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
+                "  I I I
+                +  0 0 7
+                +  0 0 6
+                +  0 1 15
+                +  0 1 14",
+            )
+            .sort_rows(),
+        );
+        top_n.expect_barrier().await;
+
+        assert_eq!(
+            top_n.expect_chunk().await.sort_rows(),
+            StreamChunk::from_pretty(
+                "  I I I
+                -  0 0 6
+                -  0 0 7
+                +  0 0 4
+                +  0 0 3
+                -  0 1 15
+                +  0 1 11
+                +  0 2 26",
+            )
+            .sort_rows(),
+        );
+        top_n.expect_barrier().await;
+
+        // no output chunk for the last input chunk
+        top_n.expect_barrier().await;
     }
 }

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,14 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Debug;
+use risingwave_common::array::{Array, I64Array};
 
-use futures::StreamExt;
-use futures_async_stream::try_stream;
-use risingwave_common::array::{Array, I64Array, StreamChunk};
-
-use super::error::StreamExecutorError;
-use super::{BoxedMessageStream, Execute, Executor, Message};
+use crate::executor::prelude::*;
 
 pub struct ExpandExecutor {
     input: Executor,
@@ -46,8 +41,8 @@ impl ExpandExecutor {
                 }
             };
             for (i, subsets) in self.column_subsets.iter().enumerate() {
-                let flags = I64Array::from_iter(std::iter::repeat(i as i64).take(input.capacity()))
-                    .into_ref();
+                let flags =
+                    I64Array::from_iter(std::iter::repeat_n(i as i64, input.capacity())).into_ref();
                 let (mut columns, vis) = input.data_chunk().keep_columns(subsets).into_parts();
                 columns.extend(input.columns().iter().cloned());
                 columns.push(flags);
@@ -81,7 +76,7 @@ mod tests {
 
     use super::ExpandExecutor;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::{Execute, PkIndices};
+    use crate::executor::{Execute, StreamKey};
 
     #[tokio::test]
     async fn test_expand() {
@@ -98,7 +93,7 @@ mod tests {
                 Field::unnamed(DataType::Int64),
                 Field::unnamed(DataType::Int64),
             ]),
-            PkIndices::new(),
+            StreamKey::new(),
         );
 
         let column_subsets = vec![vec![0, 1], vec![1, 2]];

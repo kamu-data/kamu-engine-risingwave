@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,19 +14,33 @@
 
 use std::sync::{Arc, LazyLock};
 
-use prometheus::core::{AtomicI64, AtomicU64, GenericCounterVec, GenericGaugeVec};
-use prometheus::{
-    exponential_buckets, histogram_opts, register_histogram_vec_with_registry,
-    register_int_counter_vec_with_registry, register_int_gauge_vec_with_registry, HistogramVec,
-    Registry,
+use prometheus::{Registry, exponential_buckets, histogram_opts};
+use risingwave_common::metrics::{
+    LabelGuardedHistogramVec, LabelGuardedIntCounterVec, LabelGuardedIntGaugeVec,
 };
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
+use risingwave_common::{
+    register_guarded_histogram_vec_with_registry, register_guarded_int_counter_vec_with_registry,
+    register_guarded_int_gauge_vec_with_registry,
+};
 
 use crate::source::kafka::stats::RdKafkaStats;
 
 #[derive(Debug, Clone)]
 pub struct EnumeratorMetrics {
-    pub high_watermark: GenericGaugeVec<AtomicI64>,
+    pub high_watermark: LabelGuardedIntGaugeVec,
+    /// PostgreSQL CDC confirmed flush LSN monitoring
+    pub pg_cdc_confirmed_flush_lsn: LabelGuardedIntGaugeVec,
+    /// PostgreSQL CDC upstream max LSN monitoring
+    pub pg_cdc_upstream_max_lsn: LabelGuardedIntGaugeVec,
+    /// MySQL CDC binlog file sequence number (min)
+    pub mysql_cdc_binlog_file_seq_min: LabelGuardedIntGaugeVec,
+    /// MySQL CDC binlog file sequence number (max)
+    pub mysql_cdc_binlog_file_seq_max: LabelGuardedIntGaugeVec,
+    /// SQL Server CDC upstream minimum LSN
+    pub sqlserver_cdc_upstream_min_lsn: LabelGuardedIntGaugeVec,
+    /// SQL Server CDC upstream maximum LSN
+    pub sqlserver_cdc_upstream_max_lsn: LabelGuardedIntGaugeVec,
 }
 
 pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
@@ -34,14 +48,71 @@ pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
 
 impl EnumeratorMetrics {
     fn new(registry: &Registry) -> Self {
-        let high_watermark = register_int_gauge_vec_with_registry!(
+        let high_watermark = register_guarded_int_gauge_vec_with_registry!(
             "source_kafka_high_watermark",
             "High watermark for a exec per partition",
             &["source_id", "partition"],
             registry,
         )
         .unwrap();
-        EnumeratorMetrics { high_watermark }
+
+        let pg_cdc_confirmed_flush_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "pg_cdc_confirmed_flush_lsn",
+            "PostgreSQL CDC confirmed flush LSN",
+            &["source_id", "slot_name"],
+            registry,
+        )
+        .unwrap();
+
+        let pg_cdc_upstream_max_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "pg_cdc_upstream_max_lsn",
+            "PostgreSQL CDC upstream max LSN (pg_current_wal_lsn)",
+            &["source_id", "slot_name"],
+            registry,
+        )
+        .unwrap();
+
+        let mysql_cdc_binlog_file_seq_min = register_guarded_int_gauge_vec_with_registry!(
+            "mysql_cdc_binlog_file_seq_min",
+            "MySQL CDC upstream binlog file sequence number (minimum/oldest)",
+            &["hostname", "port"],
+            registry,
+        )
+        .unwrap();
+
+        let mysql_cdc_binlog_file_seq_max = register_guarded_int_gauge_vec_with_registry!(
+            "mysql_cdc_binlog_file_seq_max",
+            "MySQL CDC upstream binlog file sequence number (maximum/newest)",
+            &["hostname", "port"],
+            registry,
+        )
+        .unwrap();
+
+        let sqlserver_cdc_upstream_min_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "sqlserver_cdc_upstream_min_lsn",
+            "SQL Server CDC upstream minimum LSN",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let sqlserver_cdc_upstream_max_lsn = register_guarded_int_gauge_vec_with_registry!(
+            "sqlserver_cdc_upstream_max_lsn",
+            "SQL Server CDC upstream maximum LSN",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        EnumeratorMetrics {
+            high_watermark,
+            pg_cdc_confirmed_flush_lsn,
+            pg_cdc_upstream_max_lsn,
+            mysql_cdc_binlog_file_seq_min,
+            mysql_cdc_binlog_file_seq_max,
+            sqlserver_cdc_upstream_min_lsn,
+            sqlserver_cdc_upstream_max_lsn,
+        }
     }
 
     pub fn unused() -> Self {
@@ -57,18 +128,28 @@ impl Default for EnumeratorMetrics {
 
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {
-    pub partition_input_count: GenericCounterVec<AtomicU64>,
+    pub partition_input_count: LabelGuardedIntCounterVec,
 
     // **Note**: for normal messages, the metric is the message's payload size.
     // For messages from load generator, the metric is the size of stream chunk.
-    pub partition_input_bytes: GenericCounterVec<AtomicU64>,
+    pub partition_input_bytes: LabelGuardedIntCounterVec,
     /// Report latest message id
-    pub latest_message_id: GenericGaugeVec<AtomicI64>,
+    pub latest_message_id: LabelGuardedIntGaugeVec,
     pub rdkafka_native_metric: Arc<RdKafkaStats>,
 
-    pub connector_source_rows_received: GenericCounterVec<AtomicU64>,
+    pub direct_cdc_event_lag_latency: LabelGuardedHistogramVec,
 
-    pub direct_cdc_event_lag_latency: HistogramVec,
+    pub parquet_source_skip_row_count: LabelGuardedIntCounterVec,
+    pub file_source_input_row_count: LabelGuardedIntCounterVec,
+    pub file_source_dirty_split_count: LabelGuardedIntGaugeVec,
+    pub file_source_failed_split_count: LabelGuardedIntCounterVec,
+
+    // kinesis source
+    pub kinesis_throughput_exceeded_count: LabelGuardedIntCounterVec,
+    pub kinesis_timeout_count: LabelGuardedIntCounterVec,
+    pub kinesis_rebuild_shard_iter_count: LabelGuardedIntCounterVec,
+    pub kinesis_early_terminate_shard_count: LabelGuardedIntCounterVec,
+    pub kinesis_lag_latency_ms: LabelGuardedHistogramVec,
 }
 
 pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
@@ -76,7 +157,7 @@ pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
 
 impl SourceMetrics {
     fn new(registry: &Registry) -> Self {
-        let partition_input_count = register_int_counter_vec_with_registry!(
+        let partition_input_count = register_guarded_int_counter_vec_with_registry!(
             "source_partition_input_count",
             "Total number of rows that have been input from specific partition",
             &[
@@ -89,7 +170,7 @@ impl SourceMetrics {
             registry
         )
         .unwrap();
-        let partition_input_bytes = register_int_counter_vec_with_registry!(
+        let partition_input_bytes = register_guarded_int_counter_vec_with_registry!(
             "source_partition_input_bytes",
             "Total bytes that have been input from specific partition",
             &[
@@ -102,19 +183,11 @@ impl SourceMetrics {
             registry
         )
         .unwrap();
-        let latest_message_id = register_int_gauge_vec_with_registry!(
+        let latest_message_id = register_guarded_int_gauge_vec_with_registry!(
             "source_latest_message_id",
             "Latest message id for a exec per partition",
             &["source_id", "actor_id", "partition"],
             registry,
-        )
-        .unwrap();
-
-        let connector_source_rows_received = register_int_counter_vec_with_registry!(
-            "source_rows_received",
-            "Number of rows received by source",
-            &["source_type", "source_id"],
-            registry
         )
         .unwrap();
 
@@ -123,17 +196,98 @@ impl SourceMetrics {
             "source_cdc_lag_latency",
             exponential_buckets(1.0, 2.0, 21).unwrap(), // max 1048s
         );
+
+        let parquet_source_skip_row_count = register_guarded_int_counter_vec_with_registry!(
+            "parquet_source_skip_row_count",
+            "Total number of rows that have been set to null in parquet source",
+            &["actor_id", "source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
         let direct_cdc_event_lag_latency =
-            register_histogram_vec_with_registry!(opts, &["table_name"], registry).unwrap();
+            register_guarded_histogram_vec_with_registry!(opts, &["table_name"], registry).unwrap();
 
         let rdkafka_native_metric = Arc::new(RdKafkaStats::new(registry.clone()));
+
+        let file_source_input_row_count = register_guarded_int_counter_vec_with_registry!(
+            "file_source_input_row_count",
+            "Total number of rows that have been read in file source",
+            &["source_id", "source_name", "actor_id", "fragment_id"],
+            registry
+        )
+        .unwrap();
+        let file_source_dirty_split_count = register_guarded_int_gauge_vec_with_registry!(
+            "file_source_dirty_split_count",
+            "Current number of dirty file splits in file source",
+            &["source_id", "source_name", "actor_id", "fragment_id"],
+            registry
+        )
+        .unwrap();
+        let file_source_failed_split_count = register_guarded_int_counter_vec_with_registry!(
+            "file_source_failed_split_count",
+            "Total number of file splits marked dirty in file source",
+            &["source_id", "source_name", "actor_id", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_throughput_exceeded_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_throughput_exceeded_count",
+            "Total number of times throughput exceeded in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_timeout_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_timeout_count",
+            "Total number of times timeout in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_rebuild_shard_iter_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_rebuild_shard_iter_count",
+            "Total number of times rebuild shard iter in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_early_terminate_shard_count = register_guarded_int_counter_vec_with_registry!(
+            "kinesis_early_terminate_shard_count",
+            "Total number of times early terminate shard in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
+        let kinesis_lag_latency_ms = register_guarded_histogram_vec_with_registry!(
+            "kinesis_lag_latency_ms",
+            "Lag latency in kinesis source",
+            &["source_id", "source_name", "fragment_id", "shard_id"],
+            registry
+        )
+        .unwrap();
+
         SourceMetrics {
             partition_input_count,
             partition_input_bytes,
             latest_message_id,
             rdkafka_native_metric,
-            connector_source_rows_received,
             direct_cdc_event_lag_latency,
+            parquet_source_skip_row_count,
+            file_source_input_row_count,
+            file_source_dirty_split_count,
+            file_source_failed_split_count,
+
+            kinesis_throughput_exceeded_count,
+            kinesis_timeout_count,
+            kinesis_rebuild_shard_iter_count,
+            kinesis_early_terminate_shard_count,
+            kinesis_lag_latency_ms,
         }
     }
 }

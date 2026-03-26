@@ -149,13 +149,8 @@ pub use must_match;
 
 #[cfg(test)]
 mod ensure_tests {
-    use std::convert::Into;
-    use std::result::Result::Err;
-
     use anyhow::anyhow;
     use thiserror::Error;
-
-    use super::*;
 
     #[derive(Error, Debug)]
     #[error(transparent)]
@@ -227,20 +222,20 @@ mod match_tests {
     #[test]
     fn test_try_match() -> Result<(), ExpandError> {
         assert_eq!(
-            try_match_expand!(MyEnum::A("failure".to_string()), MyEnum::A)?,
+            try_match_expand!(MyEnum::A("failure".to_owned()), MyEnum::A)?,
             "failure"
         );
         assert_eq!(
-            try_match_expand!(MyEnum::A("failure".to_string()), MyEnum::A)?,
+            try_match_expand!(MyEnum::A("failure".to_owned()), MyEnum::A)?,
             "failure"
         );
         assert_eq!(
-            try_match_expand!(MyEnum::A("failure".to_string()), MyEnum::A)?,
+            try_match_expand!(MyEnum::A("failure".to_owned()), MyEnum::A)?,
             "failure"
         );
 
         // Test let statement is compilable.
-        let err_str = try_match_expand!(MyEnum::A("failure".to_string()), MyEnum::A)?;
+        let err_str = try_match_expand!(MyEnum::A("failure".to_owned()), MyEnum::A)?;
         assert_eq!(err_str, "failure");
         Ok(())
     }

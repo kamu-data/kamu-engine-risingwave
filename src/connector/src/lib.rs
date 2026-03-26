@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,17 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(dead_code)]
 #![allow(clippy::derive_partial_eq_without_eq)]
-#![feature(array_chunks)]
+#![warn(clippy::large_futures, clippy::large_stack_frames)]
 #![feature(coroutines)]
 #![feature(proc_macro_hygiene)]
 #![feature(stmt_expr_attributes)]
 #![feature(box_patterns)]
 #![feature(trait_alias)]
-#![feature(lint_reasons)]
-#![feature(lazy_cell)]
-#![feature(let_chains)]
 #![feature(box_into_inner)]
 #![feature(type_alias_impl_trait)]
 #![feature(associated_type_defaults)]
@@ -32,17 +28,27 @@
 #![feature(iterator_try_collect)]
 #![feature(try_blocks)]
 #![feature(error_generic_member_access)]
+#![feature(negative_impls)]
 #![feature(register_tool)]
+#![feature(assert_matches)]
+#![feature(never_type)]
+#![feature(map_try_insert)]
 #![register_tool(rw)]
 #![recursion_limit = "256"]
+#![feature(min_specialization)]
+#![feature(custom_inner_attributes)]
+#![feature(iter_array_chunks)]
 
 use std::time::Duration;
 
 use duration_str::parse_std;
-use risingwave_pb::connector_service::SinkPayloadFormat;
 use serde::de;
 
 pub mod aws_utils;
+
+pub mod allow_alter_on_fly_fields;
+
+mod enforce_secret;
 pub mod error;
 mod macros;
 
@@ -54,25 +60,18 @@ pub mod source;
 pub mod connector_common;
 
 pub use paste::paste;
+pub use risingwave_jni_core::{call_method, call_static_method, jvm_runtime};
 
 mod with_options;
-pub use with_options::WithPropertiesExt;
+pub use with_options::{Get, GetKeyIter, WithOptionsSecResolved, WithPropertiesExt};
 
 #[cfg(test)]
 mod with_options_test;
 
-#[derive(Clone, Debug, Default)]
-pub struct ConnectorParams {
-    pub sink_payload_format: SinkPayloadFormat,
-}
-
-impl ConnectorParams {
-    pub fn new(sink_payload_format: SinkPayloadFormat) -> Self {
-        Self {
-            sink_payload_format,
-        }
-    }
-}
+pub const AUTO_SCHEMA_CHANGE_KEY: &str = "auto.schema.change";
+pub const SINK_CREATE_TABLE_IF_NOT_EXISTS_KEY: &str = "create_table_if_not_exists";
+pub const SINK_TARGET_TABLE_NAME: &str = "table.name";
+pub const SINK_INTERMEDIATE_TABLE_NAME: &str = "intermediate.table.name";
 
 pub(crate) fn deserialize_u32_from_string<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
@@ -85,6 +84,41 @@ where
             &"integer greater than or equal to 0",
         )
     })
+}
+
+pub(crate) fn deserialize_optional_string_seq_from_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: Option<String> = de::Deserialize::deserialize(deserializer)?;
+    if let Some(s) = s {
+        let s = s.to_ascii_lowercase();
+        let s = s.split(',').map(|s| s.trim().to_owned()).collect();
+        Ok(Some(s))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn deserialize_optional_u64_seq_from_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<u64>>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: Option<String> = de::Deserialize::deserialize(deserializer)?;
+    if let Some(s) = s {
+        let numbers = s
+            .split(',')
+            .map(|s| s.trim().parse())
+            .collect::<Result<Vec<u64>, _>>()
+            .map_err(|_| de::Error::invalid_value(de::Unexpected::Str(&s), &"invalid number"));
+        Ok(Some(numbers?))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn deserialize_bool_from_string<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -103,6 +137,28 @@ where
     }
 }
 
+pub(crate) fn deserialize_optional_bool_from_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: Option<String> = de::Deserialize::deserialize(deserializer)?;
+    if let Some(s) = s {
+        let s = s.to_ascii_lowercase();
+        match s.as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(de::Error::invalid_value(
+                de::Unexpected::Str(&s),
+                &"true or false",
+            )),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) fn deserialize_duration_from_string<'de, D>(
     deserializer: D,
 ) -> Result<Duration, D::Error>
@@ -116,11 +172,30 @@ where
     ))
 }
 
+pub(crate) fn deserialize_optional_duration_from_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: Option<String> = de::Deserialize::deserialize(deserializer)?;
+    if let Some(s) = s {
+        let duration = parse_std(&s).map_err(|_| de::Error::invalid_value(
+            de::Unexpected::Str(&s),
+            &"The String value unit support for one of:[“y”,“mon”,“w”,“d”,“h”,“m”,“s”, “ms”, “µs”, “ns”]",
+        ))?;
+        Ok(Some(duration))
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use expect_test::expect_file;
 
     use crate::with_options_test::{
+        generate_allow_alter_on_fly_fields_combined, generate_with_options_yaml_connection,
         generate_with_options_yaml_sink, generate_with_options_yaml_source,
     };
 
@@ -132,10 +207,22 @@ mod tests {
         expect_file!("../with_options_source.yaml").assert_eq(&generate_with_options_yaml_source());
 
         expect_file!("../with_options_sink.yaml").assert_eq(&generate_with_options_yaml_sink());
+
+        expect_file!("../with_options_connection.yaml")
+            .assert_eq(&generate_with_options_yaml_connection());
+    }
+
+    /// This test ensures that the `allow_alter_on_fly` fields Rust file is up-to-date.
+    #[test]
+    fn test_allow_alter_on_fly_fields_rust_up_to_date() {
+        expect_file!("../src/allow_alter_on_fly_fields.rs")
+            .assert_eq(&generate_allow_alter_on_fly_fields_combined());
     }
 
     /// Test some serde behavior we rely on.
     mod serde {
+        #![expect(dead_code)]
+
         use std::collections::BTreeMap;
 
         use expect_test::expect;

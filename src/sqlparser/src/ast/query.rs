@@ -10,18 +10,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
-
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use crate::ast::*;
 
 /// The most complete variant of a `SELECT` query expression, optionally
 /// including `WITH`, `UNION` / other set operations, and `ORDER BY`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Query {
     /// WITH (common table expressions, or CTEs)
     pub with: Option<With>,
@@ -30,7 +23,7 @@ pub struct Query {
     /// ORDER BY
     pub order_by: Vec<OrderByExpr>,
     /// `LIMIT { <N> | ALL }`
-    pub limit: Option<String>,
+    pub limit: Option<Expr>,
     /// `OFFSET <N> [ { ROW | ROWS } ]`
     ///
     /// `ROW` and `ROWS` are noise words that don't influence the effect of the clause.
@@ -55,6 +48,44 @@ impl Query {
                 offset: None,
                 fetch: None,
             } if order_by.is_empty() => Some(values),
+            _ => None,
+        }
+    }
+
+    /// `SELECT <expr>` without other clauses.
+    pub fn as_single_select_item(&self) -> Option<&Expr> {
+        match &self {
+            Query {
+                with: None,
+                body: SetExpr::Select(select),
+                order_by,
+                limit: None,
+                offset: None,
+                fetch: None,
+            } if order_by.is_empty() => match select.as_ref() {
+                Select {
+                    distinct: Distinct::All,
+                    projection,
+                    from,
+                    lateral_views,
+                    selection: None,
+                    group_by,
+                    having: None,
+                    window,
+                } if projection.len() == 1
+                    && from.is_empty()
+                    && lateral_views.is_empty()
+                    && group_by.is_empty()
+                    && window.is_empty() =>
+                {
+                    match &projection[0] {
+                        SelectItem::UnnamedExpr(expr) => Some(expr),
+                        SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -86,7 +117,6 @@ impl fmt::Display for Query {
 /// `SELECT ... [ {UNION|EXCEPT|INTERSECT} SELECT ...]`
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SetExpr {
     /// Restricted SELECT .. FROM .. HAVING (no ORDER BY or set operations)
     Select(Box<Select>),
@@ -97,6 +127,7 @@ pub enum SetExpr {
     SetOperation {
         op: SetOperator,
         all: bool,
+        corresponding: Corresponding,
         left: Box<SetExpr>,
         right: Box<SetExpr>,
     },
@@ -114,16 +145,16 @@ impl fmt::Display for SetExpr {
                 right,
                 op,
                 all,
+                corresponding,
             } => {
                 let all_str = if *all { " ALL" } else { "" };
-                write!(f, "{} {}{} {}", left, op, all_str, right)
+                write!(f, "{} {}{}{} {}", left, op, all_str, corresponding, right)
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SetOperator {
     Union,
     Except,
@@ -140,11 +171,53 @@ impl fmt::Display for SetOperator {
     }
 }
 
+/// `CORRESPONDING [ BY <left paren> <corresponding column list> <right paren> ]`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Corresponding {
+    pub corresponding: bool,
+    pub column_list: Option<Vec<Ident>>,
+}
+
+impl Corresponding {
+    pub fn with_column_list(column_list: Option<Vec<Ident>>) -> Self {
+        Self {
+            corresponding: true,
+            column_list,
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            corresponding: false,
+            column_list: None,
+        }
+    }
+
+    pub fn is_corresponding(&self) -> bool {
+        self.corresponding
+    }
+
+    pub fn column_list(&self) -> Option<&[Ident]> {
+        self.column_list.as_deref()
+    }
+}
+
+impl fmt::Display for Corresponding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.corresponding {
+            write!(f, " CORRESPONDING")?;
+            if let Some(column_list) = &self.column_list {
+                write!(f, " BY ({})", display_comma_separated(column_list))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A restricted variant of `SELECT` (without CTEs/`ORDER BY`), which may
 /// appear either as the only body item of an `SQLQuery`, or as an operand
 /// to a set operation like `UNION`.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Select {
     pub distinct: Distinct,
     /// projection expressions
@@ -159,6 +232,8 @@ pub struct Select {
     pub group_by: Vec<Expr>,
     /// HAVING
     pub having: Option<Expr>,
+    /// WINDOW
+    pub window: Vec<NamedWindow>,
 }
 
 impl fmt::Display for Select {
@@ -182,13 +257,15 @@ impl fmt::Display for Select {
         if let Some(ref having) = self.having {
             write!(f, " HAVING {}", having)?;
         }
+        if !self.window.is_empty() {
+            write!(f, " WINDOW {}", display_comma_separated(&self.window))?;
+        }
         Ok(())
     }
 }
 
 /// An `ALL`, `DISTINCT` or `DISTINCT ON (expr, ...)` after `SELECT`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[expect(clippy::enum_variant_names)]
 pub enum Distinct {
     /// An optional parameter that returns all matching rows.
@@ -224,7 +301,6 @@ impl fmt::Display for Distinct {
 
 /// A hive LATERAL VIEW with potential column aliases
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LateralView {
     /// LATERAL VIEW
     pub lateral_view: Expr,
@@ -257,7 +333,6 @@ impl fmt::Display for LateralView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct With {
     pub recursive: bool,
     pub cte_tables: Vec<Cte>,
@@ -275,30 +350,36 @@ impl fmt::Display for With {
 }
 
 /// A single CTE (used after `WITH`): `alias [(col1, col2, ...)] AS ( query )`
+///
 /// The names in the column list before `AS`, when specified, replace the names
 /// of the columns returned by the query. The parser does not validate that the
 /// number of columns in the query matches the number of columns in the query.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Cte {
     pub alias: TableAlias,
-    pub query: Query,
-    pub from: Option<Ident>,
+    pub cte_inner: CteInner,
 }
 
 impl fmt::Display for Cte {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} AS ({})", self.alias, self.query)?;
-        if let Some(ref fr) = self.from {
-            write!(f, " FROM {}", fr)?;
+        match &self.cte_inner {
+            CteInner::Query(query) => write!(f, "{} AS ({})", self.alias, query)?,
+            CteInner::ChangeLog(obj_name) => {
+                write!(f, "{} AS changelog from {}", self.alias, obj_name)?
+            }
         }
         Ok(())
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CteInner {
+    Query(Box<Query>),
+    ChangeLog(ObjectName),
+}
+
 /// One item of the comma-separated list following `SELECT`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum SelectItem {
     /// Any expression, not followed by `[ AS ] alias`
     UnnamedExpr(Expr),
@@ -357,7 +438,6 @@ impl fmt::Display for SelectItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TableWithJoins {
     pub relation: TableFactor,
     pub joins: Vec<Join>,
@@ -375,7 +455,6 @@ impl fmt::Display for TableWithJoins {
 
 /// A table name or a parenthesized subquery with an optional alias
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum TableFactor {
     Table {
         name: ObjectName,
@@ -410,9 +489,8 @@ impl fmt::Display for TableFactor {
         match self {
             TableFactor::Table { name, alias, as_of } => {
                 write!(f, "{}", name)?;
-                match as_of {
-                    Some(as_of) => write!(f, "{}", as_of)?,
-                    None => (),
+                if let Some(as_of) = as_of {
+                    write!(f, "{}", as_of)?
                 }
                 if let Some(alias) = alias {
                     write!(f, " AS {}", alias)?;
@@ -454,7 +532,6 @@ impl fmt::Display for TableFactor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TableAlias {
     pub name: Ident,
     pub columns: Vec<Ident>,
@@ -471,7 +548,6 @@ impl fmt::Display for TableAlias {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Join {
     pub relation: TableFactor,
     pub join_operator: JoinOperator,
@@ -487,7 +563,7 @@ impl fmt::Display for Join {
         }
         fn suffix(constraint: &'_ JoinConstraint) -> impl fmt::Display + '_ {
             struct Suffix<'a>(&'a JoinConstraint);
-            impl<'a> fmt::Display for Suffix<'a> {
+            impl fmt::Display for Suffix<'_> {
                 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     match self.0 {
                         JoinConstraint::On(expr) => write!(f, " ON {}", expr),
@@ -530,22 +606,36 @@ impl fmt::Display for Join {
                 suffix(constraint)
             ),
             JoinOperator::CrossJoin => write!(f, " CROSS JOIN {}", self.relation),
+            JoinOperator::AsOfInner(constraint) => write!(
+                f,
+                " {}ASOF JOIN {}{}",
+                prefix(constraint),
+                self.relation,
+                suffix(constraint)
+            ),
+            JoinOperator::AsOfLeft(constraint) => write!(
+                f,
+                " {}ASOF LEFT JOIN {}{}",
+                prefix(constraint),
+                self.relation,
+                suffix(constraint)
+            ),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum JoinOperator {
     Inner(JoinConstraint),
     LeftOuter(JoinConstraint),
     RightOuter(JoinConstraint),
     FullOuter(JoinConstraint),
     CrossJoin,
+    AsOfInner(JoinConstraint),
+    AsOfLeft(JoinConstraint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum JoinConstraint {
     On(Expr),
     Using(Vec<Ident>),
@@ -555,7 +645,6 @@ pub enum JoinConstraint {
 
 /// An `ORDER BY` expression
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct OrderByExpr {
     pub expr: Expr,
     /// Optional `ASC` or `DESC`
@@ -582,7 +671,6 @@ impl fmt::Display for OrderByExpr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Fetch {
     pub with_ties: bool,
     pub quantity: Option<String>,
@@ -600,7 +688,6 @@ impl fmt::Display for Fetch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Top {
     /// SQL semantic equivalent of LIMIT but with same structure as FETCH.
     pub with_ties: bool,
@@ -621,7 +708,6 @@ impl fmt::Display for Top {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Values(pub Vec<Vec<Expr>>);
 
 impl fmt::Display for Values {
@@ -634,5 +720,18 @@ impl fmt::Display for Values {
             write!(f, "({})", display_comma_separated(row))?;
         }
         Ok(())
+    }
+}
+
+/// A named window definition in the WINDOW clause
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NamedWindow {
+    pub name: Ident,
+    pub window_spec: WindowSpec,
+}
+
+impl fmt::Display for NamedWindow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} AS ({})", self.name, self.window_spec)
     }
 }

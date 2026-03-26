@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -77,6 +77,10 @@ impl Epoch {
         Epoch((mi - UNIX_RISINGWAVE_DATE_SEC * 1000) << EPOCH_PHYSICAL_SHIFT_BITS)
     }
 
+    pub fn from_unix_millis_or_earliest(mi: u64) -> Self {
+        Epoch((mi.saturating_sub(UNIX_RISINGWAVE_DATE_SEC * 1000)) << EPOCH_PHYSICAL_SHIFT_BITS)
+    }
+
     pub fn physical_now() -> u64 {
         UNIX_RISINGWAVE_DATE_EPOCH
             .elapsed()
@@ -125,8 +129,7 @@ pub const MAX_SPILL_TIMES: u16 = ((1 << EPOCH_AVAILABLE_BITS) - 1) as u16;
 // Low EPOCH_AVAILABLE_BITS bits set to 1
 pub const EPOCH_SPILL_TIME_MASK: u64 = (1 << EPOCH_AVAILABLE_BITS) - 1;
 // High (64-EPOCH_AVAILABLE_BITS) bits set to 1
-const EPOCH_MASK: u64 = !EPOCH_SPILL_TIME_MASK;
-pub const MAX_EPOCH: u64 = u64::MAX & EPOCH_MASK;
+pub const MAX_EPOCH: u64 = !((1 << EPOCH_AVAILABLE_BITS) - 1);
 
 // EPOCH_INC_MIN_STEP_FOR_TEST is the minimum increment step for epoch in unit tests.
 // We need to keep the lower 16 bits of the epoch unchanged during each increment,
@@ -174,10 +177,11 @@ impl EpochPair {
         Self::new(curr, curr - EPOCH_INC_MIN_STEP_FOR_TEST)
     }
 }
-/// As most unit tests initializ a new epoch from a random value (e.g. 1, 2, 233 etc.), but the correct epoch in the system is a u64 with the last `EPOCH_AVAILABLE_BITS` bits set to 0.
+
+/// As most unit tests initialize a new epoch from a random value (e.g. 1, 2, 233 etc.), but the correct epoch in the system is a u64 with the last `EPOCH_AVAILABLE_BITS` bits set to 0.
 /// This method is to turn a a random epoch into a well shifted value.
-pub const fn test_epoch(value: u64) -> u64 {
-    value << EPOCH_AVAILABLE_BITS
+pub const fn test_epoch(value_millis: u64) -> u64 {
+    value_millis << EPOCH_AVAILABLE_BITS
 }
 
 /// There are numerous operations in our system's unit tests that involve incrementing or decrementing the epoch.

@@ -1,23 +1,24 @@
-// Copyright 2024 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright 2023 RisingWave Labs
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package com.risingwave.connector.source.core;
 
-import com.risingwave.connector.api.source.*;
 import com.risingwave.connector.source.common.DbzConnectorConfig;
 import com.risingwave.connector.source.common.DbzSourceUtils;
-import com.risingwave.java.binding.Binding;
+import com.risingwave.java.binding.CdcSourceChannel;
 import com.risingwave.proto.ConnectorServiceProto.GetEventStreamResponse;
 import io.debezium.config.CommonConnectorConfig;
 import io.grpc.stub.StreamObserver;
@@ -28,21 +29,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /** Single-thread engine runner */
-public class DbzCdcEngineRunner implements CdcEngineRunner {
+public class DbzCdcEngineRunner {
     static final Logger LOG = LoggerFactory.getLogger(DbzCdcEngineRunner.class);
 
     private final ExecutorService executor;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private CdcEngine engine;
+    private DbzCdcEngine engine;
     private final DbzConnectorConfig config;
 
-    public static CdcEngineRunner newCdcEngineRunner(
+    public static DbzCdcEngineRunner newCdcEngineRunner(
             DbzConnectorConfig config, StreamObserver<GetEventStreamResponse> responseObserver) {
         DbzCdcEngineRunner runner = null;
         try {
             var sourceId = config.getSourceId();
             var engine =
                     new DbzCdcEngine(
+                            config.getSourceType(),
                             config.getSourceId(),
                             config.getResolvedDebeziumProps(),
                             (success, message, error) -> {
@@ -69,13 +71,14 @@ public class DbzCdcEngineRunner implements CdcEngineRunner {
         return runner;
     }
 
-    public static CdcEngineRunner create(DbzConnectorConfig config, long channelPtr) {
+    public static DbzCdcEngineRunner create(DbzConnectorConfig config, CdcSourceChannel channel) {
         DbzCdcEngineRunner runner = new DbzCdcEngineRunner(config);
         try {
             var sourceId = config.getSourceId();
             final DbzCdcEngineRunner finalRunner = runner;
             var engine =
                     new DbzCdcEngine(
+                            config.getSourceType(),
                             config.getSourceId(),
                             config.getResolvedDebeziumProps(),
                             (success, message, error) -> {
@@ -89,8 +92,7 @@ public class DbzCdcEngineRunner implements CdcEngineRunner {
                                             (error != null && error.getMessage() != null
                                                     ? error.getMessage()
                                                     : message);
-                                    if (!Binding.sendCdcSourceErrorToChannel(
-                                            channelPtr, errorMsg)) {
+                                    if (!channel.sendError(errorMsg)) {
                                         LOG.warn(
                                                 "engine#{} unable to send error message: {}",
                                                 sourceId,
@@ -123,7 +125,7 @@ public class DbzCdcEngineRunner implements CdcEngineRunner {
         this.config = config;
     }
 
-    private void withEngine(CdcEngine engine) {
+    private void withEngine(DbzCdcEngine engine) {
         this.engine = engine;
     }
 
@@ -144,7 +146,9 @@ public class DbzCdcEngineRunner implements CdcEngineRunner {
                             .getProperty(CommonConnectorConfig.TOPIC_PREFIX.name());
             startOk =
                     DbzSourceUtils.waitForStreamingRunning(
-                            config.getSourceType(), databaseServerName);
+                            config.getSourceType(),
+                            databaseServerName,
+                            config.getWaitStreamingStartTimeout());
         }
 
         running.set(true);
@@ -160,14 +164,16 @@ public class DbzCdcEngineRunner implements CdcEngineRunner {
         }
     }
 
-    @Override
-    public CdcEngine getEngine() {
+    public DbzCdcEngine getEngine() {
         return engine;
     }
 
-    @Override
     public boolean isRunning() {
         return running.get();
+    }
+
+    public DbzChangeEventConsumer getChangeEventConsumer() {
+        return engine.getChangeEventConsumer();
     }
 
     private void cleanUp() {

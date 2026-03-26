@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,11 @@ use crate::error::PsqlError;
 use crate::pg_field_descriptor::PgFieldDescriptor;
 use crate::pg_protocol::ParameterStatus;
 use crate::pg_server::BoxedError;
-use crate::types::Row;
+use crate::types::{Format, Row};
 
 pub type RowSet = Vec<Row>;
 pub type RowSetResult = Result<RowSet, BoxedError>;
+
 pub trait ValuesStream = Stream<Item = RowSetResult> + Unpin + Send;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -42,6 +43,7 @@ pub enum StatementType {
     FETCH,
     COPY,
     EXPLAIN,
+    CLOSE_CURSOR,
     CREATE_TABLE,
     CREATE_MATERIALIZED_VIEW,
     CREATE_VIEW,
@@ -52,16 +54,21 @@ pub enum StatementType {
     CREATE_SCHEMA,
     CREATE_USER,
     CREATE_INDEX,
+    CREATE_AGGREGATE,
     CREATE_FUNCTION,
     CREATE_CONNECTION,
+    CREATE_SECRET,
     COMMENT,
+    DECLARE_CURSOR,
     DESCRIBE,
     GRANT_PRIVILEGE,
+    DISCARD,
     DROP_TABLE,
     DROP_MATERIALIZED_VIEW,
     DROP_VIEW,
     DROP_INDEX,
     DROP_FUNCTION,
+    DROP_AGGREGATE,
     DROP_SOURCE,
     DROP_SINK,
     DROP_SUBSCRIPTION,
@@ -69,7 +76,9 @@ pub enum StatementType {
     DROP_DATABASE,
     DROP_USER,
     DROP_CONNECTION,
+    DROP_SECRET,
     ALTER_DATABASE,
+    ALTER_DEFAULT_PRIVILEGES,
     ALTER_SCHEMA,
     ALTER_INDEX,
     ALTER_VIEW,
@@ -81,6 +90,8 @@ pub enum StatementType {
     ALTER_FUNCTION,
     ALTER_CONNECTION,
     ALTER_SYSTEM,
+    ALTER_SECRET,
+    ALTER_FRAGMENT,
     REVOKE_PRIVILEGE,
     // Introduce ORDER_BY statement type cuz Calcite unvalidated AST has SqlKind.ORDER_BY. Note
     // that Statement Type is not designed to be one to one mapping with SqlKind.
@@ -92,6 +103,7 @@ pub enum StatementType {
     UPDATE_USER,
     ABORT,
     FLUSH,
+    REFRESH_TABLE,
     OTHER,
     // EMPTY is used when query statement is empty (e.g. ";").
     EMPTY,
@@ -100,8 +112,16 @@ pub enum StatementType {
     ROLLBACK,
     SET_TRANSACTION,
     CANCEL_COMMAND,
+    FETCH_CURSOR,
     WAIT,
     KILL,
+    BACKUP,
+    DELETE_META_SNAPSHOTS,
+    RECOVER,
+    USE,
+    PREPARE,
+    DEALLOCATE,
+    VACUUM,
 }
 
 impl std::fmt::Display for StatementType {
@@ -111,13 +131,18 @@ impl std::fmt::Display for StatementType {
 }
 
 pub trait Callback = Future<Output = Result<(), BoxedError>> + Send;
+
 pub type BoxedCallback = Pin<Box<dyn Callback>>;
 
 pub struct PgResponse<VS> {
     stmt_type: StatementType,
+    is_copy_query_to_stdout: bool,
+
     // row count of affected row. Used for INSERT, UPDATE, DELETE, COPY, and other statements that
     // don't return rows.
     row_cnt: Option<i32>,
+    // Used for INSERT, UPDATE, DELETE to specify the format of the affected row count.
+    row_cnt_format: Option<Format>,
     notices: Vec<String>,
     values_stream: Option<VS>,
     callback: Option<BoxedCallback>,
@@ -130,6 +155,8 @@ pub struct PgResponseBuilder<VS> {
     // row count of affected row. Used for INSERT, UPDATE, DELETE, COPY, and other statements that
     // don't return rows.
     row_cnt: Option<i32>,
+    // Used for INSERT, UPDATE, DELETE to specify the format of the affected row count.
+    row_cnt_format: Option<Format>,
     notices: Vec<String>,
     values_stream: Option<VS>,
     callback: Option<BoxedCallback>,
@@ -141,7 +168,9 @@ impl<VS> From<PgResponseBuilder<VS>> for PgResponse<VS> {
     fn from(builder: PgResponseBuilder<VS>) -> Self {
         Self {
             stmt_type: builder.stmt_type,
+            is_copy_query_to_stdout: false, // set a false from builder, alter later
             row_cnt: builder.row_cnt,
+            row_cnt_format: builder.row_cnt_format,
             notices: builder.notices,
             values_stream: builder.values_stream,
             callback: builder.callback,
@@ -157,6 +186,7 @@ impl<VS> PgResponseBuilder<VS> {
         Self {
             stmt_type,
             row_cnt,
+            row_cnt_format: None,
             notices: vec![],
             values_stream: None,
             callback: None,
@@ -174,6 +204,13 @@ impl<VS> PgResponseBuilder<VS> {
 
     pub fn row_cnt_opt(self, row_cnt: Option<i32>) -> Self {
         Self { row_cnt, ..self }
+    }
+
+    pub fn row_cnt_format_opt(self, row_cnt_format: Option<Format>) -> Self {
+        Self {
+            row_cnt_format,
+            ..self
+        }
     }
 
     pub fn values(self, values_stream: VS, row_desc: Vec<PgFieldDescriptor>) -> Self {
@@ -256,7 +293,9 @@ impl StatementType {
             }
             Statement::AlterTable { .. } => Ok(StatementType::ALTER_TABLE),
             Statement::AlterSystem { .. } => Ok(StatementType::ALTER_SYSTEM),
+            Statement::AlterFragment { .. } => Ok(StatementType::ALTER_FRAGMENT),
             Statement::DropFunction { .. } => Ok(StatementType::DROP_FUNCTION),
+            Statement::Discard(..) => Ok(StatementType::DISCARD),
             Statement::SetVariable { .. } => Ok(StatementType::SET_VARIABLE),
             Statement::ShowVariable { .. } => Ok(StatementType::SHOW_VARIABLE),
             Statement::StartTransaction { .. } => Ok(StatementType::START_TRANSACTION),
@@ -285,14 +324,23 @@ impl StatementType {
                 risingwave_sqlparser::ast::ObjectType::Connection => {
                     Ok(StatementType::DROP_CONNECTION)
                 }
+                risingwave_sqlparser::ast::ObjectType::Secret => Ok(StatementType::DROP_SECRET),
                 risingwave_sqlparser::ast::ObjectType::Subscription => {
                     Ok(StatementType::DROP_SUBSCRIPTION)
                 }
             },
             Statement::Explain { .. } => Ok(StatementType::EXPLAIN),
+            Statement::DeclareCursor { .. } => Ok(StatementType::DECLARE_CURSOR),
+            Statement::FetchCursor { .. } => Ok(StatementType::FETCH_CURSOR),
+            Statement::CloseCursor { .. } => Ok(StatementType::CLOSE_CURSOR),
             Statement::Flush => Ok(StatementType::FLUSH),
-            Statement::Wait => Ok(StatementType::WAIT),
-            _ => Err("unsupported statement type".to_string()),
+            Statement::Wait(_) => Ok(StatementType::WAIT),
+            Statement::Backup => Ok(StatementType::BACKUP),
+            Statement::DeleteMetaSnapshots { .. } => Ok(StatementType::DELETE_META_SNAPSHOTS),
+            Statement::Recover => Ok(StatementType::RECOVER),
+            Statement::Use { .. } => Ok(StatementType::USE),
+            Statement::Vacuum { .. } => Ok(StatementType::VACUUM),
+            _ => Err("unsupported statement type".to_owned()),
         }
     }
 
@@ -336,6 +384,8 @@ impl StatementType {
                 | StatementType::DELETE_RETURNING
                 | StatementType::UPDATE_RETURNING
                 | StatementType::CANCEL_COMMAND
+                | StatementType::BACKUP
+                | StatementType::FETCH_CURSOR
         )
     }
 
@@ -361,6 +411,12 @@ where
         PgResponseBuilder::empty(stmt_type).into()
     }
 
+    pub fn into_copy_query_to_stdout(mut self) -> Self {
+        self.is_copy_query_to_stdout = true;
+        self.stmt_type = StatementType::COPY;
+        self
+    }
+
     pub fn stmt_type(&self) -> StatementType {
         self.stmt_type
     }
@@ -377,6 +433,10 @@ where
         self.row_cnt
     }
 
+    pub fn row_cnt_format(&self) -> Option<Format> {
+        self.row_cnt_format
+    }
+
     pub fn is_query(&self) -> bool {
         self.stmt_type.is_query()
     }
@@ -385,8 +445,12 @@ where
         self.stmt_type == StatementType::EMPTY
     }
 
-    pub fn row_desc(&self) -> Vec<PgFieldDescriptor> {
-        self.row_desc.clone()
+    pub fn is_copy_query_to_stdout(&self) -> bool {
+        self.is_copy_query_to_stdout
+    }
+
+    pub fn row_desc(&self) -> &[PgFieldDescriptor] {
+        &self.row_desc
     }
 
     pub fn values_stream(&mut self) -> &mut VS {

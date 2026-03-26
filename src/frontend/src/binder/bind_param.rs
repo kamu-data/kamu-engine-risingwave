@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,10 @@ use risingwave_common::bail;
 use risingwave_common::error::BoxedError;
 use risingwave_common::types::{Datum, ScalarImpl};
 
-use super::statement::RewriteExprsRecursive;
 use super::BoundStatement;
+use super::statement::RewriteExprsRecursive;
 use crate::error::{ErrorCode, Result};
-use crate::expr::{Expr, ExprImpl, ExprRewriter, Literal};
+use crate::expr::{Expr, ExprImpl, ExprRewriter, Literal, default_rewrite_expr};
 
 /// Rewrites parameter expressions to literals.
 pub(crate) struct ParamRewriter {
@@ -47,22 +47,7 @@ impl ExprRewriter for ParamRewriter {
         if self.error.is_some() {
             return expr;
         }
-        match expr {
-            ExprImpl::InputRef(inner) => self.rewrite_input_ref(*inner),
-            ExprImpl::Literal(inner) => self.rewrite_literal(*inner),
-            ExprImpl::FunctionCall(inner) => self.rewrite_function_call(*inner),
-            ExprImpl::FunctionCallWithLambda(inner) => {
-                self.rewrite_function_call_with_lambda(*inner)
-            }
-            ExprImpl::AggCall(inner) => self.rewrite_agg_call(*inner),
-            ExprImpl::Subquery(inner) => self.rewrite_subquery(*inner),
-            ExprImpl::CorrelatedInputRef(inner) => self.rewrite_correlated_input_ref(*inner),
-            ExprImpl::TableFunction(inner) => self.rewrite_table_function(*inner),
-            ExprImpl::WindowFunction(inner) => self.rewrite_window_function(*inner),
-            ExprImpl::UserDefinedFunction(inner) => self.rewrite_user_defined_function(*inner),
-            ExprImpl::Parameter(inner) => self.rewrite_parameter(*inner),
-            ExprImpl::Now(inner) => self.rewrite_now(*inner),
-        }
+        default_rewrite_expr(self, expr)
     }
 
     fn rewrite_subquery(&mut self, mut subquery: crate::expr::Subquery) -> ExprImpl {
@@ -139,8 +124,8 @@ mod test {
     use risingwave_common::types::DataType;
     use risingwave_sqlparser::test_utils::parse_sql_statements;
 
-    use crate::binder::test_utils::{mock_binder, mock_binder_with_param_types};
     use crate::binder::BoundStatement;
+    use crate::binder::test_utils::{mock_binder, mock_binder_with_param_types};
 
     fn create_expect_bound(sql: &str) -> BoundStatement {
         let mut binder = mock_binder();

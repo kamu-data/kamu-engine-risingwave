@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,11 +13,6 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use futures::StreamExt;
-use risingwave_common::types::DataType;
-use risingwave_storage::StateStore;
-
-use crate::executor::{Barrier, BoxedMessageStream, Execute};
 
 mod cache;
 mod sides;
@@ -27,7 +22,7 @@ mod impl_;
 
 pub use impl_::LookupExecutorParams;
 
-use super::{ActorContextRef, Executor};
+use crate::executor::prelude::*;
 
 #[cfg(test)]
 mod tests;

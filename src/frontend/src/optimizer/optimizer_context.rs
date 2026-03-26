@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::convert::Into;
 use core::fmt::Formatter;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use risingwave_sqlparser::ast::{ExplainOptions, ExplainType};
+use risingwave_sqlparser::ast::{ExplainFormat, ExplainOptions, ExplainType};
 
+use super::property::WatermarkGroupId;
 use crate::expr::{CorrelatedId, SessionTimezone};
 use crate::handler::HandlerArgs;
+use crate::optimizer::LogicalPlanRef;
 use crate::optimizer::plan_node::PlanNodeId;
 use crate::session::SessionImpl;
 use crate::utils::{OverwriteOptions, WithOptions};
+use crate::{Explain, TableCatalog};
 
 const RESERVED_ID_NUM: u16 = 10000;
 
+type PhantomUnsend = PhantomData<Rc<()>>;
+
 pub struct OptimizerContext {
     session_ctx: Arc<SessionImpl>,
-    /// Store plan node id
-    next_plan_node_id: RefCell<i32>,
     /// The original SQL string, used for debugging.
     sql: Arc<str>,
     /// Normalized SQL string. See [`HandlerArgs::normalize_sql`].
@@ -42,19 +46,49 @@ pub struct OptimizerContext {
     optimizer_trace: RefCell<Vec<String>>,
     /// Store the optimized logical plan of optimizer
     logical_explain: RefCell<Option<String>>,
-    /// Store correlated id
-    next_correlated_id: RefCell<u32>,
     /// Store options or properties from the `with` clause
     with_options: WithOptions,
     /// Store the Session Timezone and whether it was used.
     session_timezone: RefCell<SessionTimezone>,
-    /// Store expr display id.
-    next_expr_display_id: RefCell<usize>,
     /// Total number of optimization rules have been applied.
     total_rule_applied: RefCell<usize>,
     /// Store the configs can be overwritten in with clause
     /// if not specified, use the value from session variable.
     overwrite_options: OverwriteOptions,
+    /// Mapping from iceberg table identifier to current snapshot id.
+    /// Used to keep same snapshot id when multiple scans from the same iceberg table exist in a query.
+    iceberg_snapshot_id_map: RefCell<HashMap<String, Option<i64>>>,
+    /// Batch materialized view candidates for exact-match rewriting.
+    batch_mview_candidates: RefCell<Vec<MaterializedViewCandidate>>,
+
+    /// Last assigned plan node ID.
+    last_plan_node_id: Cell<i32>,
+    /// Last assigned correlated ID.
+    last_correlated_id: Cell<u32>,
+    /// Last assigned expr display ID.
+    last_expr_display_id: Cell<usize>,
+    /// Last assigned watermark group ID.
+    last_watermark_group_id: Cell<u32>,
+
+    // TODO: remove this when locality backfill is enabled by default
+    /// Count of places where locality backfill could have been applied but was not,
+    /// because `enable_locality_backfill` is off.
+    missed_locality_providers: Cell<usize>,
+
+    _phantom: PhantomUnsend,
+}
+
+#[derive(Clone, Debug)]
+pub struct MaterializedViewCandidate {
+    pub plan: LogicalPlanRef,
+    pub table: Arc<TableCatalog>,
+}
+
+pub(in crate::optimizer) struct LastAssignedIds {
+    last_plan_node_id: i32,
+    last_correlated_id: u32,
+    last_expr_display_id: usize,
+    last_watermark_group_id: u32,
 }
 
 pub type OptimizerContextRef = Rc<OptimizerContext>;
@@ -69,23 +103,32 @@ impl OptimizerContext {
     /// Create a new [`OptimizerContext`] from the given [`HandlerArgs`] and [`ExplainOptions`].
     pub fn new(mut handler_args: HandlerArgs, explain_options: ExplainOptions) -> Self {
         let session_timezone = RefCell::new(SessionTimezone::new(
-            handler_args.session.config().timezone().to_owned(),
+            handler_args.session.config().timezone(),
         ));
         let overwrite_options = OverwriteOptions::new(&mut handler_args);
         Self {
             session_ctx: handler_args.session,
-            next_plan_node_id: RefCell::new(RESERVED_ID_NUM.into()),
             sql: handler_args.sql,
             normalized_sql: handler_args.normalized_sql,
             explain_options,
             optimizer_trace: RefCell::new(vec![]),
             logical_explain: RefCell::new(None),
-            next_correlated_id: RefCell::new(0),
             with_options: handler_args.with_options,
             session_timezone,
-            next_expr_display_id: RefCell::new(RESERVED_ID_NUM.into()),
             total_rule_applied: RefCell::new(0),
             overwrite_options,
+            iceberg_snapshot_id_map: RefCell::new(HashMap::new()),
+            batch_mview_candidates: RefCell::new(Vec::new()),
+
+            last_plan_node_id: Cell::new(RESERVED_ID_NUM.into()),
+            last_correlated_id: Cell::new(0),
+            last_expr_display_id: Cell::new(RESERVED_ID_NUM.into()),
+            last_watermark_group_id: Cell::new(RESERVED_ID_NUM.into()),
+
+            // TODO: remove this when locality backfill is enabled by default
+            missed_locality_providers: Cell::new(0),
+
+            _phantom: Default::default(),
         }
     }
 
@@ -95,51 +138,73 @@ impl OptimizerContext {
     pub async fn mock() -> OptimizerContextRef {
         Self {
             session_ctx: Arc::new(SessionImpl::mock()),
-            next_plan_node_id: RefCell::new(0),
             sql: Arc::from(""),
             normalized_sql: "".to_owned(),
             explain_options: ExplainOptions::default(),
             optimizer_trace: RefCell::new(vec![]),
             logical_explain: RefCell::new(None),
-            next_correlated_id: RefCell::new(0),
             with_options: Default::default(),
             session_timezone: RefCell::new(SessionTimezone::new("UTC".into())),
-            next_expr_display_id: RefCell::new(0),
             total_rule_applied: RefCell::new(0),
             overwrite_options: OverwriteOptions::default(),
+            iceberg_snapshot_id_map: RefCell::new(HashMap::new()),
+            batch_mview_candidates: RefCell::new(Vec::new()),
+
+            last_plan_node_id: Cell::new(0),
+            last_correlated_id: Cell::new(0),
+            last_expr_display_id: Cell::new(0),
+            last_watermark_group_id: Cell::new(0),
+
+            missed_locality_providers: Cell::new(0),
+
+            _phantom: Default::default(),
         }
         .into()
     }
 
     pub fn next_plan_node_id(&self) -> PlanNodeId {
-        *self.next_plan_node_id.borrow_mut() += 1;
-        PlanNodeId(*self.next_plan_node_id.borrow())
-    }
-
-    pub fn get_plan_node_id(&self) -> i32 {
-        *self.next_plan_node_id.borrow()
-    }
-
-    pub fn set_plan_node_id(&self, next_plan_node_id: i32) {
-        *self.next_plan_node_id.borrow_mut() = next_plan_node_id;
-    }
-
-    pub fn next_expr_display_id(&self) -> usize {
-        *self.next_expr_display_id.borrow_mut() += 1;
-        *self.next_expr_display_id.borrow()
-    }
-
-    pub fn get_expr_display_id(&self) -> usize {
-        *self.next_expr_display_id.borrow()
-    }
-
-    pub fn set_expr_display_id(&self, expr_display_id: usize) {
-        *self.next_expr_display_id.borrow_mut() = expr_display_id;
+        self.last_plan_node_id.update(|id| id + 1);
+        PlanNodeId(self.last_plan_node_id.get())
     }
 
     pub fn next_correlated_id(&self) -> CorrelatedId {
-        *self.next_correlated_id.borrow_mut() += 1;
-        *self.next_correlated_id.borrow()
+        self.last_correlated_id.update(|id| id + 1);
+        self.last_correlated_id.get()
+    }
+
+    pub fn next_expr_display_id(&self) -> usize {
+        self.last_expr_display_id.update(|id| id + 1);
+        self.last_expr_display_id.get()
+    }
+
+    pub fn next_watermark_group_id(&self) -> WatermarkGroupId {
+        self.last_watermark_group_id.update(|id| id + 1);
+        self.last_watermark_group_id.get()
+    }
+
+    pub(in crate::optimizer) fn backup_elem_ids(&self) -> LastAssignedIds {
+        LastAssignedIds {
+            last_plan_node_id: self.last_plan_node_id.get(),
+            last_correlated_id: self.last_correlated_id.get(),
+            last_expr_display_id: self.last_expr_display_id.get(),
+            last_watermark_group_id: self.last_watermark_group_id.get(),
+        }
+    }
+
+    /// This should only be called in [`crate::optimizer::plan_node::reorganize_elements_id`].
+    pub(in crate::optimizer) fn reset_elem_ids(&self) {
+        self.last_plan_node_id.set(0);
+        self.last_correlated_id.set(0);
+        self.last_expr_display_id.set(0);
+        self.last_watermark_group_id.set(0);
+    }
+
+    pub(in crate::optimizer) fn restore_elem_ids(&self, backup: LastAssignedIds) {
+        self.last_plan_node_id.set(backup.last_plan_node_id);
+        self.last_correlated_id.set(backup.last_correlated_id);
+        self.last_expr_display_id.set(backup.last_expr_display_id);
+        self.last_watermark_group_id
+            .set(backup.last_watermark_group_id);
     }
 
     pub fn add_rule_applied(&self, num: usize) {
@@ -158,12 +223,8 @@ impl OptimizerContext {
         self.explain_options.trace
     }
 
-    pub fn explain_type(&self) -> ExplainType {
-        self.explain_options.explain_type.clone()
-    }
-
-    pub fn is_explain_logical(&self) -> bool {
-        self.explain_type() == ExplainType::Logical
+    fn is_explain_logical(&self) -> bool {
+        self.explain_options.explain_type == ExplainType::Logical
     }
 
     pub fn trace(&self, str: impl Into<String>) {
@@ -173,17 +234,44 @@ impl OptimizerContext {
         }
         let mut optimizer_trace = self.optimizer_trace.borrow_mut();
         let string = str.into();
-        tracing::trace!(target: "explain_trace", "{}", string);
+        tracing::info!(target: "explain_trace", "\n{}", string);
         optimizer_trace.push(string);
-        optimizer_trace.push("\n".to_string());
+        optimizer_trace.push("\n".to_owned());
     }
 
     pub fn warn_to_user(&self, str: impl Into<String>) {
         self.session_ctx().notice_to_user(str);
     }
 
-    pub fn store_logical(&self, str: impl Into<String>) {
-        *self.logical_explain.borrow_mut() = Some(str.into())
+    // TODO: remove this when locality backfill is enabled by default
+    /// Increment the counter for missed locality providers.
+    /// Called when locality backfill could have been applied but `enable_locality_backfill` is off.
+    pub fn inc_missed_locality_providers(&self) {
+        self.missed_locality_providers
+            .set(self.missed_locality_providers.get() + 1);
+    }
+
+    // TODO: remove this when locality backfill is enabled by default
+    /// Get the number of missed locality providers.
+    pub fn missed_locality_providers(&self) -> usize {
+        self.missed_locality_providers.get()
+    }
+
+    fn explain_plan_impl(&self, plan: &impl Explain) -> String {
+        match self.explain_options.explain_format {
+            ExplainFormat::Text => plan.explain_to_string(),
+            ExplainFormat::Json => plan.explain_to_json(),
+            ExplainFormat::Xml => plan.explain_to_xml(),
+            ExplainFormat::Yaml => plan.explain_to_yaml(),
+            ExplainFormat::Dot => plan.explain_to_dot(),
+        }
+    }
+
+    pub fn may_store_explain_logical(&self, plan: &LogicalPlanRef) {
+        if self.is_explain_logical() {
+            let str = self.explain_plan_impl(plan);
+            *self.logical_explain.borrow_mut() = Some(str);
+        }
     }
 
     pub fn take_logical(&self) -> Option<String> {
@@ -200,6 +288,16 @@ impl OptimizerContext {
 
     pub fn overwrite_options(&self) -> &OverwriteOptions {
         &self.overwrite_options
+    }
+
+    pub fn add_batch_mview_candidate(&self, table: Arc<TableCatalog>, plan: LogicalPlanRef) {
+        self.batch_mview_candidates
+            .borrow_mut()
+            .push(MaterializedViewCandidate { plan, table });
+    }
+
+    pub fn batch_mview_candidates(&self) -> std::cell::Ref<'_, Vec<MaterializedViewCandidate>> {
+        self.batch_mview_candidates.borrow()
     }
 
     pub fn session_ctx(&self) -> &Arc<SessionImpl> {
@@ -223,18 +321,22 @@ impl OptimizerContext {
     pub fn get_session_timezone(&self) -> String {
         self.session_timezone.borrow().timezone()
     }
+
+    pub fn iceberg_snapshot_id_map(&self) -> RefMut<'_, HashMap<String, Option<i64>>> {
+        self.iceberg_snapshot_id_map.borrow_mut()
+    }
 }
 
 impl std::fmt::Debug for OptimizerContext {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "QueryContext {{ next_plan_node_id = {}, sql = {}, explain_options = {}, next_correlated_id = {}, with_options = {:?} }}",
-            self.next_plan_node_id.borrow(),
+            "QueryContext {{ sql = {}, explain_options = {}, with_options = {:?}, last_plan_node_id = {}, last_correlated_id = {} }}",
             self.sql,
             self.explain_options,
-            self.next_correlated_id.borrow(),
-            &self.with_options
+            self.with_options,
+            self.last_plan_node_id.get(),
+            self.last_correlated_id.get(),
         )
     }
 }

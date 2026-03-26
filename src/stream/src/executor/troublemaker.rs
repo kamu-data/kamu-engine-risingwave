@@ -12,20 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::StreamExt;
-use futures_async_stream::try_stream;
 use rand::Rng;
-use risingwave_common::array::stream_chunk_builder::StreamChunkBuilder;
-use risingwave_common::array::stream_record::{Record, RecordType};
 use risingwave_common::array::Op;
+use risingwave_common::array::stream_record::{Record, RecordType};
 use risingwave_common::field_generator::{FieldGeneratorImpl, VarcharProperty};
-use risingwave_common::row::{OwnedRow, Row};
-use risingwave_common::types::DataType;
 use risingwave_common::util::iter_util::ZipEqFast;
 use smallvec::SmallVec;
 
-use super::{BoxedMessageStream, Execute, Executor, Message, StreamExecutorError};
 use crate::consistency::insane;
+use crate::executor::prelude::*;
 
 /// [`TroublemakerExecutor`] is used to make some trouble in the stream graph. Specifically,
 /// it is attached to `StreamScan` and `Source` executors in **insane mode**. It randomly
@@ -110,7 +105,10 @@ impl TroublemakerExecutor {
                     }
                 }
                 Message::Barrier(barrier) => {
-                    assert!(vars.chunk_builder.take().is_none(), "we don't merge chunks");
+                    assert!(
+                        vars.chunk_builder.take().is_none(),
+                        "we don't merge chunks across barriers"
+                    );
                     yield Message::Barrier(barrier);
                 }
                 _ => yield msg,
@@ -123,7 +121,7 @@ impl TroublemakerExecutor {
         vars: &'a mut Vars,
         record: Record<impl Row>,
     ) -> SmallVec<[(Op, OwnedRow); 2]> {
-        let record = if vars.met_delete_before && rand::thread_rng().gen_bool(0.5) {
+        let record = if vars.met_delete_before && rand::rng().random_bool(0.5) {
             // Change the `Op`.
             // Because we don't know the `append_only` property of the stream, we can't
             // generate `Delete` arbitrarily. So we just generate `Delete` after we saw
@@ -161,11 +159,11 @@ impl TroublemakerExecutor {
             .map(|(op, row)| {
                 let mut data = row.into_inner();
 
-                for (datum, gen) in data
+                for (datum, r#gen) in data
                     .iter_mut()
                     .zip_eq_fast(vars.field_generators.iter_mut())
                 {
-                    match rand::thread_rng().gen_range(0..4) {
+                    match rand::rng().random_range(0..4) {
                         0 | 1 => {
                             // don't change the value
                         }
@@ -173,9 +171,9 @@ impl TroublemakerExecutor {
                             *datum = None;
                         }
                         3 => {
-                            *datum = gen
+                            *datum = r#gen
                                 .as_mut()
-                                .and_then(|gen| gen.generate_datum(rand::random()))
+                                .and_then(|r#gen| r#gen.generate_datum(rand::random()))
                                 .or(datum.take());
                         }
                         _ => unreachable!(),

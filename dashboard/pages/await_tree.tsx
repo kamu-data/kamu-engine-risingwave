@@ -1,5 +1,5 @@
 /*
- * Copyright 2024 RisingWave Labs
+ * Copyright 2025 RisingWave Labs
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,8 +86,16 @@ export default function AwaitTreeDump() {
         .entries()
         .map(([k, v]) => `[Barrier ${k}]\n${v}`)
         .join("\n")
+      const barrierWorkerState = _(response.barrierWorkerState)
+        .entries()
+        .map(([k, v]) => `[BarrierWorkerState (Worker ${k})]\n${v}`)
+        .join("\n")
+      const jvmStackTraces = _(response.jvmStackTraces)
+        .entries()
+        .map(([k, v]) => `[JVM (Worker ${k})]\n${v}`)
+        .join("\n")
 
-      result = `${title}\n\n${actorTraces}\n${rpcTraces}\n${compactionTraces}\n${barrierTraces}`
+      result = `${title}\n\n${actorTraces}\n${rpcTraces}\n${compactionTraces}\n${barrierTraces}\n${barrierWorkerState}\n\n${jvmStackTraces}`
     } catch (e: any) {
       result = `${title}\n\nERROR: ${e.message}\n${e.cause}`
     }

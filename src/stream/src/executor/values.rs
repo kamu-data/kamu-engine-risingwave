@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,40 +14,35 @@
 
 use std::vec;
 
-use await_tree::InstrumentAwait;
-use futures::StreamExt;
-use futures_async_stream::try_stream;
-use risingwave_common::array::{DataChunk, Op, StreamChunk};
-use risingwave_common::catalog::Schema;
+use risingwave_common::array::{DataChunk, Op};
 use risingwave_common::ensure;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_expr::expr::NonStrictExpression;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::{ActorContextRef, Barrier, BoxedMessageStream, Execute, Message, StreamExecutorError};
-use crate::task::CreateMviewProgress;
+use crate::executor::prelude::*;
+use crate::task::CreateMviewProgressReporter;
 
 const DEFAULT_CHUNK_SIZE: usize = 1024;
 
 /// Execute `values` in stream. As is a leaf, current workaround holds a `barrier_executor`.
-/// May refractor with `BarrierRecvExecutor` in the near future.
+/// May refactor with `BarrierRecvExecutor` in the near future.
 pub struct ValuesExecutor {
     ctx: ActorContextRef,
 
     schema: Schema,
     // Receiver of barrier channel.
     barrier_receiver: UnboundedReceiver<Barrier>,
-    progress: CreateMviewProgress,
+    progress: CreateMviewProgressReporter,
 
     rows: vec::IntoIter<Vec<NonStrictExpression>>,
 }
 
 impl ValuesExecutor {
-    /// Currently hard-code the `pk_indices` as the last column.
     pub fn new(
         ctx: ActorContextRef,
         schema: Schema,
-        progress: CreateMviewProgress,
+        progress: CreateMviewProgressReporter,
         rows: Vec<Vec<NonStrictExpression>>,
         barrier_receiver: UnboundedReceiver<Barrier>,
     ) -> Self {
@@ -123,9 +118,12 @@ impl ValuesExecutor {
             }
         }
 
+        let mut finish_reported = !emit;
+
         while let Some(barrier) = barrier_receiver.recv().await {
-            if emit {
-                progress.finish(barrier.epoch.curr, 0);
+            if !finish_reported {
+                progress.finish(barrier.epoch, 0);
+                finish_reported = true;
             }
             yield Message::Barrier(barrier);
         }
@@ -154,12 +152,14 @@ mod tests {
     use super::ValuesExecutor;
     use crate::executor::test_utils::StreamExecutorTestExt;
     use crate::executor::{ActorContext, AddMutation, Barrier, Execute, Mutation};
-    use crate::task::{CreateMviewProgress, LocalBarrierManager};
+    use crate::task::CreateMviewProgressReporter;
+    use crate::task::barrier_test_utils::LocalBarrierTestEnv;
 
     #[tokio::test]
     async fn test_values() {
-        let barrier_manager = LocalBarrierManager::for_test();
-        let progress = CreateMviewProgress::for_test(barrier_manager);
+        let test_env = LocalBarrierTestEnv::for_test().await;
+        let barrier_manager = test_env.local_barrier_manager.clone();
+        let progress = CreateMviewProgressReporter::for_test(barrier_manager);
         let actor_id = progress.actor_id();
         let (tx, barrier_receiver) = unbounded_channel();
         let value = StructValue::new(vec![Some(1.into()), Some(2.into()), Some(3.into())]);
@@ -177,10 +177,7 @@ mod tests {
                 Some(ScalarImpl::Int64(3)),
             )),
             Box::new(LiteralExpression::new(
-                DataType::new_struct(
-                    vec![DataType::Int32, DataType::Int32, DataType::Int32],
-                    vec![],
-                ),
+                StructType::unnamed(vec![DataType::Int32, DataType::Int32, DataType::Int32]).into(),
                 Some(ScalarImpl::Struct(value)),
             )),
             Box::new(LiteralExpression::new(
@@ -196,10 +193,12 @@ mod tests {
             ActorContext::for_test(actor_id),
             schema,
             progress,
-            vec![exprs
-                .into_iter()
-                .map(NonStrictExpression::for_test)
-                .collect()],
+            vec![
+                exprs
+                    .into_iter()
+                    .map(NonStrictExpression::for_test)
+                    .collect(),
+            ],
             barrier_receiver,
         );
         let mut values_executor = Box::new(values_executor_struct).execute();
@@ -207,10 +206,8 @@ mod tests {
         // Init barrier
         let first_message =
             Barrier::new_test_barrier(test_epoch(1)).with_mutation(Mutation::Add(AddMutation {
-                adds: Default::default(),
                 added_actors: maplit::hashset! {actor_id},
-                splits: Default::default(),
-                pause: false,
+                ..Default::default()
             }));
         tx.send(first_message).unwrap();
 
@@ -225,7 +222,7 @@ mod tests {
         let result = values_msg
             .into_chunk()
             .unwrap()
-            .compact()
+            .compact_vis()
             .data_chunk()
             .to_owned();
 

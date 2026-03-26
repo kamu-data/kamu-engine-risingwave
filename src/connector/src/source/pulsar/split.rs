@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@ use risingwave_common::types::JsonbVal;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConnectorResult;
-use crate::source::pulsar::topic::Topic;
 use crate::source::pulsar::PulsarEnumeratorOffset;
+use crate::source::pulsar::topic::Topic;
 use crate::source::{SplitId, SplitMetaData};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Hash)]
@@ -40,11 +40,11 @@ impl SplitMetaData for PulsarSplit {
         serde_json::to_value(self.clone()).unwrap().into()
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
-        let start_offset = if start_offset.is_empty() {
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        let start_offset = if last_seen_offset.is_empty() {
             PulsarEnumeratorOffset::Earliest
         } else {
-            PulsarEnumeratorOffset::MessageId(start_offset)
+            PulsarEnumeratorOffset::MessageId(last_seen_offset)
         };
 
         self.start_offset = start_offset;

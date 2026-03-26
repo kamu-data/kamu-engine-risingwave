@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
 use bytes::{Buf, BufMut};
+use risingwave_hummock_sdk::HummockRawObjectId;
 use risingwave_hummock_sdk::version::HummockVersion;
 
 use crate::error::BackupResult;
-use crate::{xxhash64_checksum, xxhash64_verify, MetaSnapshotId};
+use crate::{MetaSnapshotId, xxhash64_checksum, xxhash64_verify};
 
 pub trait Metadata: Display + Send + Sync {
     fn encode_to(&self, buf: &mut Vec<u8>) -> BackupResult<()>;
@@ -30,6 +32,12 @@ pub trait Metadata: Display + Send + Sync {
     fn hummock_version_ref(&self) -> &HummockVersion;
 
     fn hummock_version(self) -> HummockVersion;
+
+    fn storage_url(&self) -> BackupResult<String>;
+
+    fn storage_directory(&self) -> BackupResult<String>;
+
+    fn table_change_log_object_ids(&self) -> HashSet<HummockRawObjectId>;
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]

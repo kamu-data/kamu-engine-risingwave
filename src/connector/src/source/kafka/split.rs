@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,14 @@ use crate::source::{SplitId, SplitMetaData};
 pub struct KafkaSplit {
     pub(crate) topic: String,
     pub(crate) partition: i32,
+    /// Note: currently the start offset is **exclusive**. We need to `+1` to create the reader.
+    /// Possible values are:
+    /// - `Earliest`: `low_watermark` - 1
+    /// - `Latest`: `high_watermark` - 1
+    /// - `Timestamp`: `offset_for_timestamp` - 1
+    /// - `last_seen_offset`
+    ///
+    /// A better approach would be to make it **inclusive**. <https://github.com/risingwavelabs/risingwave/pull/16257>
     pub(crate) start_offset: Option<i64>,
     pub(crate) stop_offset: Option<i64>,
 }
@@ -40,8 +48,8 @@ impl SplitMetaData for KafkaSplit {
         serde_json::to_value(self.clone()).unwrap().into()
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
-        self.start_offset = Some(start_offset.as_str().parse::<i64>().unwrap());
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
+        self.start_offset = Some(last_seen_offset.as_str().parse::<i64>().unwrap());
         Ok(())
     }
 }

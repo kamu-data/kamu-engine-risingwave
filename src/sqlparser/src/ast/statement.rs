@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2025 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,26 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::fmt;
-use std::fmt::Write;
+use std::fmt;
+use std::fmt::{Formatter, Write};
 
 use itertools::Itertools;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use winnow::ModalResult;
 
 use super::ddl::SourceWatermark;
-use super::legacy_source::{parse_source_schema, CompatibleSourceSchema};
-use super::{EmitMode, Ident, ObjectType, Query};
+use super::legacy_source::{CompatibleFormatEncode, parse_format_encode};
+use super::{EmitMode, Ident, ObjectType, Query, Value};
 use crate::ast::{
-    display_comma_separated, display_separated, ColumnDef, ObjectName, SqlOption, TableConstraint,
+    ColumnDef, ObjectName, SqlOption, TableConstraint, display_comma_separated, display_separated,
 };
 use crate::keywords::Keyword;
-use crate::parser::{IncludeOption, IsOptional, Parser, ParserError, UPSTREAM_SOURCE_KEY};
+use crate::parser::{IncludeOption, IsOptional, Parser};
+use crate::parser_err;
+use crate::parser_v2::literal_u32;
 use crate::tokenizer::Token;
 
 /// Consumes token from the parser into an AST node.
 pub trait ParseTo: Sized {
-    fn parse_to(parser: &mut Parser) -> Result<Self, ParserError>;
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self>;
 }
 
 #[macro_export]
@@ -59,11 +60,11 @@ macro_rules! impl_fmt_display {
     }};
     ($field:ident => [$($arr:tt)+], $v:ident, $self:ident) => {
         if $self.$field {
-            $v.push(format!("{}", AstVec([$($arr)+].to_vec())));
+            $v.push(format!("{}", display_separated(&[$($arr)+], " ")));
         }
     };
     ([$($arr:tt)+], $v:ident) => {
-        $v.push(format!("{}", AstVec([$($arr)+].to_vec())));
+        $v.push(format!("{}", display_separated(&[$($arr)+], " ")));
     };
 }
 
@@ -72,12 +73,12 @@ macro_rules! impl_fmt_display {
 //     source_name: Ident,
 //     with_properties: AstOption<WithProperties>,
 //     [Keyword::ROW, Keyword::FORMAT],
-//     source_schema: SourceSchema,
+//     format_encode: SourceSchema,
 //     [Keyword::WATERMARK, Keyword::FOR] column [Keyword::AS] <expr>
 // });
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CreateSourceStatement {
+    pub temporary: bool,
     pub if_not_exists: bool,
     pub columns: Vec<ColumnDef>,
     // The wildchar position in columns defined in sql. Only exist when using external schema.
@@ -85,22 +86,33 @@ pub struct CreateSourceStatement {
     pub constraints: Vec<TableConstraint>,
     pub source_name: ObjectName,
     pub with_properties: WithProperties,
-    pub source_schema: CompatibleSourceSchema,
+    pub format_encode: CompatibleFormatEncode,
     pub source_watermarks: Vec<SourceWatermark>,
     pub include_column_options: IncludeOption,
 }
 
+/// FORMAT means how to get the operation(Insert/Delete) from the input.
+///
+/// Check `CONNECTORS_COMPATIBLE_FORMATS` for what `FORMAT ... ENCODE ...` combinations are allowed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Format {
+    /// The format is the same with RisingWave's internal representation.
+    /// Used internally for schema change
     Native,
-    None,          // Keyword::NONE
-    Debezium,      // Keyword::DEBEZIUM
-    DebeziumMongo, // Keyword::DEBEZIUM_MONGO
-    Maxwell,       // Keyword::MAXWELL
-    Canal,         // Keyword::CANAL
-    Upsert,        // Keyword::UPSERT
-    Plain,         // Keyword::PLAIN
+    /// for self-explanatory sources like iceberg, they have their own format, and should not be specified by user.
+    None,
+    // Keyword::DEBEZIUM
+    Debezium,
+    // Keyword::DEBEZIUM_MONGO
+    DebeziumMongo,
+    // Keyword::MAXWELL
+    Maxwell,
+    // Keyword::CANAL
+    Canal,
+    // Keyword::UPSERT
+    Upsert,
+    // Keyword::PLAIN
+    Plain,
 }
 
 // TODO: unify with `from_keyword`
@@ -124,7 +136,7 @@ impl fmt::Display for Format {
 }
 
 impl Format {
-    pub fn from_keyword(s: &str) -> Result<Self, ParserError> {
+    pub fn from_keyword(s: &str) -> ModalResult<Self> {
         Ok(match s {
             "DEBEZIUM" => Format::Debezium,
             "DEBEZIUM_MONGO" => Format::DebeziumMongo,
@@ -132,29 +144,31 @@ impl Format {
             "CANAL" => Format::Canal,
             "PLAIN" => Format::Plain,
             "UPSERT" => Format::Upsert,
-            "NATIVE" => Format::Native, // used internally for schema change
-            "NONE" => Format::None, // used by iceberg
-            _ => {
-                return Err(ParserError::ParserError(
-                    "expected CANAL | PROTOBUF | DEBEZIUM | MAXWELL | PLAIN | NATIVE | NONE after FORMAT"
-                        .to_string(),
-                ))
-            }
+            "NATIVE" => Format::Native,
+            "NONE" => Format::None,
+            _ => parser_err!(
+                "expected CANAL | PROTOBUF | DEBEZIUM | MAXWELL | PLAIN | NATIVE | NONE after FORMAT"
+            ),
         })
     }
 }
 
+/// Check `CONNECTORS_COMPATIBLE_FORMATS` for what `FORMAT ... ENCODE ...` combinations are allowed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum Encode {
     Avro,     // Keyword::Avro
     Csv,      // Keyword::CSV
     Protobuf, // Keyword::PROTOBUF
     Json,     // Keyword::JSON
     Bytes,    // Keyword::BYTES
-    None,     // Keyword::None
+    /// for self-explanatory sources like iceberg, they have their own format, and should not be specified by user.
+    None,
+    Text, // Keyword::TEXT
+    /// The encode is the same with RisingWave's internal representation.
+    /// Used internally for schema change
     Native,
     Template,
+    Parquet,
 }
 
 // TODO: unify with `from_keyword`
@@ -172,112 +186,122 @@ impl fmt::Display for Encode {
                 Encode::Native => "NATIVE",
                 Encode::Template => "TEMPLATE",
                 Encode::None => "NONE",
+                Encode::Parquet => "PARQUET",
+                Encode::Text => "TEXT",
             }
         )
     }
 }
 
 impl Encode {
-    pub fn from_keyword(s: &str) -> Result<Self, ParserError> {
+    pub fn from_keyword(s: &str) -> ModalResult<Self> {
         Ok(match s {
             "AVRO" => Encode::Avro,
+            "TEXT" => Encode::Text,
             "BYTES" => Encode::Bytes,
             "CSV" => Encode::Csv,
             "PROTOBUF" => Encode::Protobuf,
             "JSON" => Encode::Json,
             "TEMPLATE" => Encode::Template,
-            "NATIVE" => Encode::Native, // used internally for schema change
-            "NONE" => Encode::None, // used by iceberg
-            _ => return Err(ParserError::ParserError(
-                "expected AVRO | BYTES | CSV | PROTOBUF | JSON | NATIVE | TEMPLATE | NONE after Encode"
-                    .to_string(),
-            )),
+            "PARQUET" => Encode::Parquet,
+            "NATIVE" => Encode::Native,
+            "NONE" => Encode::None,
+            _ => parser_err!(
+                "expected AVRO | BYTES | CSV | PROTOBUF | JSON | NATIVE | TEMPLATE | PARQUET | NONE after Encode"
+            ),
         })
     }
 }
 
+/// `FORMAT ... ENCODE ... [(a=b, ...)] [KEY ENCODE ...]`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct ConnectorSchema {
+pub struct FormatEncodeOptions {
     pub format: Format,
     pub row_encode: Encode,
     pub row_options: Vec<SqlOption>,
+
+    pub key_encode: Option<Encode>,
 }
 
-impl Parser {
+impl Parser<'_> {
     /// Peek the next tokens to see if it is `FORMAT` or `ROW FORMAT` (for compatibility).
-    fn peek_source_schema_format(&mut self) -> bool {
+    fn peek_format_encode_format(&mut self) -> bool {
         (self.peek_nth_any_of_keywords(0, &[Keyword::ROW])
             && self.peek_nth_any_of_keywords(1, &[Keyword::FORMAT])) // ROW FORMAT
             || self.peek_nth_any_of_keywords(0, &[Keyword::FORMAT]) // FORMAT
     }
 
     /// Parse the source schema. The behavior depends on the `connector` type.
-    pub fn parse_source_schema_with_connector(
+    pub fn parse_format_encode_with_connector(
         &mut self,
         connector: &str,
         cdc_source_job: bool,
-    ) -> Result<CompatibleSourceSchema, ParserError> {
+    ) -> ModalResult<CompatibleFormatEncode> {
         // row format for cdc source must be debezium json
         // row format for nexmark source must be native
         // default row format for datagen source is native
         // FIXME: parse input `connector` to enum type instead using string here
         if connector.contains("-cdc") {
             let expected = if cdc_source_job {
-                ConnectorSchema::plain_json()
+                FormatEncodeOptions::plain_json()
             } else if connector.contains("mongodb") {
-                ConnectorSchema::debezium_mongo_json()
+                FormatEncodeOptions::debezium_mongo_json()
             } else {
-                ConnectorSchema::debezium_json()
+                FormatEncodeOptions::debezium_json()
             };
 
-            if self.peek_source_schema_format() {
-                let schema = parse_source_schema(self)?.into_v2();
+            if self.peek_format_encode_format() {
+                let schema = parse_format_encode(self)?.into_v2();
                 if schema != expected {
-                    return Err(ParserError::ParserError(format!(
+                    parser_err!(
                         "Row format for CDC connectors should be \
                          either omitted or set to `{expected}`",
-                    )));
+                    );
                 }
             }
             Ok(expected.into())
         } else if connector.contains("nexmark") {
-            let expected = ConnectorSchema::native();
-            if self.peek_source_schema_format() {
-                let schema = parse_source_schema(self)?.into_v2();
+            let expected = FormatEncodeOptions::native();
+            if self.peek_format_encode_format() {
+                let schema = parse_format_encode(self)?.into_v2();
                 if schema != expected {
-                    return Err(ParserError::ParserError(format!(
+                    parser_err!(
                         "Row format for nexmark connectors should be \
                          either omitted or set to `{expected}`",
-                    )));
+                    );
                 }
             }
             Ok(expected.into())
         } else if connector.contains("datagen") {
-            Ok(if self.peek_source_schema_format() {
-                parse_source_schema(self)?
+            Ok(if self.peek_format_encode_format() {
+                parse_format_encode(self)?
             } else {
-                ConnectorSchema::native().into()
+                FormatEncodeOptions::native().into()
             })
-        } else if connector.contains("iceberg") {
-            let expected = ConnectorSchema::none();
-            if self.peek_source_schema_format() {
-                let schema = parse_source_schema(self)?.into_v2();
+        } else if connector.contains("iceberg") || connector.contains("adbc_snowflake") {
+            let expected = FormatEncodeOptions::none();
+            if self.peek_format_encode_format() {
+                let schema = parse_format_encode(self)?.into_v2();
                 if schema != expected {
-                    return Err(ParserError::ParserError(format!(
+                    parser_err!(
                         "Row format for iceberg connectors should be \
                          either omitted or set to `{expected}`",
-                    )));
+                    );
                 }
             }
             Ok(expected.into())
+        } else if connector.contains("webhook") {
+            parser_err!(
+                "Source with webhook connector is not supported. \
+                 Please use the `CREATE TABLE ... WITH ...` statement instead.",
+            );
         } else {
-            Ok(parse_source_schema(self)?)
+            Ok(parse_format_encode(self)?)
         }
     }
 
     /// Parse `FORMAT ... ENCODE ... (...)`.
-    pub fn parse_schema(&mut self) -> Result<Option<ConnectorSchema>, ParserError> {
+    pub fn parse_schema(&mut self) -> ModalResult<Option<FormatEncodeOptions>> {
         if !self.parse_keyword(Keyword::FORMAT) {
             return Ok(None);
         }
@@ -291,56 +315,70 @@ impl Parser {
         let row_encode = Encode::from_keyword(&s)?;
         let row_options = self.parse_options()?;
 
-        Ok(Some(ConnectorSchema {
+        let key_encode = if self.parse_keywords(&[Keyword::KEY, Keyword::ENCODE]) {
+            Some(Encode::from_keyword(
+                self.parse_identifier()?.value.to_ascii_uppercase().as_str(),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Some(FormatEncodeOptions {
             format,
             row_encode,
             row_options,
+            key_encode,
         }))
     }
 }
 
-impl ConnectorSchema {
+impl FormatEncodeOptions {
     pub const fn plain_json() -> Self {
-        ConnectorSchema {
+        FormatEncodeOptions {
             format: Format::Plain,
             row_encode: Encode::Json,
             row_options: Vec::new(),
+            key_encode: None,
         }
     }
 
     /// Create a new source schema with `Debezium` format and `Json` encoding.
     pub const fn debezium_json() -> Self {
-        ConnectorSchema {
+        FormatEncodeOptions {
             format: Format::Debezium,
             row_encode: Encode::Json,
             row_options: Vec::new(),
+            key_encode: None,
         }
     }
 
     pub const fn debezium_mongo_json() -> Self {
-        ConnectorSchema {
+        FormatEncodeOptions {
             format: Format::DebeziumMongo,
             row_encode: Encode::Json,
             row_options: Vec::new(),
+            key_encode: None,
         }
     }
 
     /// Create a new source schema with `Native` format and encoding.
     pub const fn native() -> Self {
-        ConnectorSchema {
+        FormatEncodeOptions {
             format: Format::Native,
             row_encode: Encode::Native,
             row_options: Vec::new(),
+            key_encode: None,
         }
     }
 
     /// Create a new source schema with `None` format and encoding.
     /// Used for self-explanatory source like iceberg.
     pub const fn none() -> Self {
-        ConnectorSchema {
+        FormatEncodeOptions {
             format: Format::None,
             row_encode: Encode::None,
             row_options: Vec::new(),
+            key_encode: None,
         }
     }
 
@@ -349,51 +387,19 @@ impl ConnectorSchema {
     }
 }
 
-impl fmt::Display for ConnectorSchema {
+impl fmt::Display for FormatEncodeOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "FORMAT {} ENCODE {}", self.format, self.row_encode)?;
 
         if !self.row_options().is_empty() {
-            write!(f, " ({})", display_comma_separated(self.row_options()))
-        } else {
-            Ok(())
+            write!(f, " ({})", display_comma_separated(self.row_options()))?;
         }
-    }
-}
 
-impl ParseTo for CreateSourceStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
-        impl_parse_to!(if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS], p);
-        impl_parse_to!(source_name: ObjectName, p);
+        if let Some(key_encode) = &self.key_encode {
+            write!(f, " KEY ENCODE {}", key_encode)?;
+        }
 
-        // parse columns
-        let (columns, constraints, source_watermarks, wildcard_idx) =
-            p.parse_columns_with_watermark()?;
-        let include_options = p.parse_include_options()?;
-
-        let with_options = p.parse_with_properties()?;
-        let option = with_options
-            .iter()
-            .find(|&opt| opt.name.real_value() == UPSTREAM_SOURCE_KEY);
-        let connector: String = option.map(|opt| opt.value.to_string()).unwrap_or_default();
-        // The format of cdc source job is fixed to `FORMAT PLAIN ENCODE JSON`
-        let cdc_source_job =
-            connector.contains("-cdc") && columns.is_empty() && constraints.is_empty();
-        // row format for nexmark source must be native
-        // default row format for datagen source is native
-        let source_schema = p.parse_source_schema_with_connector(&connector, cdc_source_job)?;
-
-        Ok(Self {
-            if_not_exists,
-            columns,
-            wildcard_idx,
-            constraints,
-            source_name,
-            with_properties: WithProperties(with_options),
-            source_schema,
-            source_watermarks,
-            include_column_options: include_options,
-        })
+        Ok(())
     }
 }
 
@@ -409,6 +415,7 @@ pub(super) fn fmt_create_items(
         || !watermarks.is_empty()
         || wildcard_idx.is_some();
     has_items.then(|| write!(&mut items, "("));
+
     if let Some(wildcard_idx) = wildcard_idx {
         let (columns_l, columns_r) = columns.split_at(wildcard_idx);
         write!(&mut items, "{}", display_comma_separated(columns_l))?;
@@ -423,14 +430,21 @@ pub(super) fn fmt_create_items(
     } else {
         write!(&mut items, "{}", display_comma_separated(columns))?;
     }
-    if !columns.is_empty() && (!constraints.is_empty() || !watermarks.is_empty()) {
+    let mut leading_items = !columns.is_empty() || wildcard_idx.is_some();
+
+    if leading_items && !constraints.is_empty() {
         write!(&mut items, ", ")?;
     }
     write!(&mut items, "{}", display_comma_separated(constraints))?;
-    if !columns.is_empty() && !constraints.is_empty() && !watermarks.is_empty() {
+    leading_items |= !constraints.is_empty();
+
+    if leading_items && !watermarks.is_empty() {
         write!(&mut items, ", ")?;
     }
     write!(&mut items, "{}", display_comma_separated(watermarks))?;
+    // uncomment this when adding more sections below
+    // leading_items |= !watermarks.is_empty();
+
     has_items.then(|| write!(&mut items, ")"));
     Ok(items)
 }
@@ -451,14 +465,25 @@ impl fmt::Display for CreateSourceStatement {
             v.push(items);
         }
 
+        for item in &self.include_column_options {
+            v.push(format!("{}", item));
+        }
+
+        // skip format_encode for cdc source
+        let is_cdc_source = self.with_properties.0.iter().any(|option| {
+            option.name.real_value().eq_ignore_ascii_case("connector")
+                && option.value.to_string().contains("cdc")
+        });
+
         impl_fmt_display!(with_properties, v, self);
-        impl_fmt_display!(source_schema, v, self);
+        if !is_cdc_source {
+            impl_fmt_display!(format_encode, v, self);
+        }
         v.iter().join(" ").fmt(f)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum CreateSink {
     From(ObjectName),
     AsQuery(Box<Query>),
@@ -472,7 +497,6 @@ impl fmt::Display for CreateSink {
         }
     }
 }
-
 // sql_grammar!(CreateSinkStatement {
 //     if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS],
 //     sink_name: Ident,
@@ -481,31 +505,35 @@ impl fmt::Display for CreateSink {
 //     with_properties: AstOption<WithProperties>,
 // });
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CreateSinkStatement {
     pub if_not_exists: bool,
     pub sink_name: ObjectName,
     pub with_properties: WithProperties,
     pub sink_from: CreateSink,
+
+    // only used when creating sink into a table
+    // insert to specific columns of the target table
     pub columns: Vec<Ident>,
     pub emit_mode: Option<EmitMode>,
-    pub sink_schema: Option<ConnectorSchema>,
+    pub sink_schema: Option<FormatEncodeOptions>,
     pub into_table_name: Option<ObjectName>,
 }
 
 impl ParseTo for CreateSinkStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!(if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS], p);
         impl_parse_to!(sink_name: ObjectName, p);
 
+        let mut target_spec_columns = Vec::new();
         let into_table_name = if p.parse_keyword(Keyword::INTO) {
             impl_parse_to!(into_table_name: ObjectName, p);
+
+            // we only allow specify columns when creating sink into a table
+            target_spec_columns = p.parse_parenthesized_column_list(IsOptional::Optional)?;
             Some(into_table_name)
         } else {
             None
         };
-
-        let columns = p.parse_parenthesized_column_list(IsOptional::Optional)?;
 
         let sink_from = if p.parse_keyword(Keyword::FROM) {
             impl_parse_to!(from_name: ObjectName, p);
@@ -514,22 +542,20 @@ impl ParseTo for CreateSinkStatement {
             let query = Box::new(p.parse_query()?);
             CreateSink::AsQuery(query)
         } else {
-            p.expected("FROM or AS after CREATE SINK sink_name", p.peek_token())?
+            p.expected("FROM or AS after CREATE SINK sink_name")?
         };
 
-        let emit_mode = p.parse_emit_mode()?;
+        let emit_mode: Option<EmitMode> = p.parse_emit_mode()?;
 
         // This check cannot be put into the `WithProperties::parse_to`, since other
         // statements may not need the with properties.
         if !p.peek_nth_any_of_keywords(0, &[Keyword::WITH]) && into_table_name.is_none() {
-            p.expected("WITH", p.peek_token())?
+            p.expected("WITH")?
         }
         impl_parse_to!(with_properties: WithProperties, p);
 
         if with_properties.0.is_empty() && into_table_name.is_none() {
-            return Err(ParserError::ParserError(
-                "sink properties not provided".to_string(),
-            ));
+            parser_err!("sink properties not provided");
         }
 
         let sink_schema = p.parse_schema()?;
@@ -539,7 +565,7 @@ impl ParseTo for CreateSinkStatement {
             sink_name,
             with_properties,
             sink_from,
-            columns,
+            columns: target_spec_columns,
             emit_mode,
             sink_schema,
             into_table_name,
@@ -555,6 +581,9 @@ impl fmt::Display for CreateSinkStatement {
         if let Some(into_table) = &self.into_table_name {
             impl_fmt_display!([Keyword::INTO], v);
             impl_fmt_display!([into_table], v);
+            if !self.columns.is_empty() {
+                v.push(format!("({})", display_comma_separated(&self.columns)));
+            }
         }
         impl_fmt_display!(sink_from, v, self);
         if let Some(ref emit_mode) = self.emit_mode {
@@ -576,7 +605,6 @@ impl fmt::Display for CreateSinkStatement {
 //     with_properties: AstOption<WithProperties>,
 // });
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CreateSubscriptionStatement {
     pub if_not_exists: bool,
     pub subscription_name: ObjectName,
@@ -586,7 +614,7 @@ pub struct CreateSubscriptionStatement {
 }
 
 impl ParseTo for CreateSubscriptionStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!(if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS], p);
         impl_parse_to!(subscription_name: ObjectName, p);
 
@@ -594,10 +622,7 @@ impl ParseTo for CreateSubscriptionStatement {
             impl_parse_to!(from_name: ObjectName, p);
             from_name
         } else {
-            p.expected(
-                "FROM after CREATE SUBSCRIPTION subscription_name",
-                p.peek_token(),
-            )?
+            p.expected("FROM after CREATE SUBSCRIPTION subscription_name")?
         };
 
         // let emit_mode = p.parse_emit_mode()?;
@@ -605,14 +630,12 @@ impl ParseTo for CreateSubscriptionStatement {
         // This check cannot be put into the `WithProperties::parse_to`, since other
         // statements may not need the with properties.
         if !p.peek_nth_any_of_keywords(0, &[Keyword::WITH]) {
-            p.expected("WITH", p.peek_token())?
+            p.expected("WITH")?
         }
         impl_parse_to!(with_properties: WithProperties, p);
 
         if with_properties.0.is_empty() {
-            return Err(ParserError::ParserError(
-                "subscription properties not provided".to_string(),
-            ));
+            parser_err!("subscription properties not provided");
         }
 
         Ok(Self {
@@ -623,6 +646,7 @@ impl ParseTo for CreateSubscriptionStatement {
         })
     }
 }
+
 impl fmt::Display for CreateSubscriptionStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut v: Vec<String> = vec![];
@@ -634,13 +658,162 @@ impl fmt::Display for CreateSubscriptionStatement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeclareCursor {
+    Query(Box<Query>),
+    Subscription(ObjectName, Since),
+}
+
+impl fmt::Display for DeclareCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut v: Vec<String> = vec![];
+        match self {
+            DeclareCursor::Query(query) => v.push(format!("{}", query.as_ref())),
+            DeclareCursor::Subscription(name, since) => {
+                v.push(format!("{}", name));
+                v.push(format!("{:?}", since));
+            }
+        }
+        v.iter().join(" ").fmt(f)
+    }
+}
+
+// sql_grammar!(DeclareCursorStatement {
+//     cursor_name: Ident,
+//     [Keyword::SUBSCRIPTION]
+//     [Keyword::CURSOR],
+//     [Keyword::FOR],
+//     subscription: Ident or query: Query,
+//     [Keyword::SINCE],
+//     rw_timestamp: Ident,
+// });
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeclareCursorStatement {
+    pub cursor_name: Ident,
+    pub declare_cursor: DeclareCursor,
+}
+
+impl ParseTo for DeclareCursorStatement {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
+        let cursor_name = p.parse_identifier_non_reserved()?;
+
+        let declare_cursor = if !p.parse_keyword(Keyword::SUBSCRIPTION) {
+            p.expect_keyword(Keyword::CURSOR)?;
+            p.expect_keyword(Keyword::FOR)?;
+            DeclareCursor::Query(Box::new(p.parse_query()?))
+        } else {
+            p.expect_keyword(Keyword::CURSOR)?;
+            p.expect_keyword(Keyword::FOR)?;
+            let cursor_for_name = p.parse_object_name()?;
+            let rw_timestamp = p.parse_since()?;
+            DeclareCursor::Subscription(cursor_for_name, rw_timestamp)
+        };
+
+        Ok(Self {
+            cursor_name,
+            declare_cursor,
+        })
+    }
+}
+
+impl fmt::Display for DeclareCursorStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut v: Vec<String> = vec![];
+        impl_fmt_display!(cursor_name, v, self);
+        match &self.declare_cursor {
+            DeclareCursor::Query(_) => {
+                v.push("CURSOR FOR ".to_owned());
+            }
+            DeclareCursor::Subscription { .. } => {
+                v.push("SUBSCRIPTION CURSOR FOR ".to_owned());
+            }
+        }
+        impl_fmt_display!(declare_cursor, v, self);
+        v.iter().join(" ").fmt(f)
+    }
+}
+
+// sql_grammar!(FetchCursorStatement {
+//     cursor_name: Ident,
+// });
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FetchCursorStatement {
+    pub cursor_name: Ident,
+    pub count: u32,
+    pub with_properties: WithProperties,
+}
+
+impl ParseTo for FetchCursorStatement {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
+        let count = if p.parse_keyword(Keyword::NEXT) {
+            1
+        } else {
+            literal_u32(p)?
+        };
+        p.expect_keyword(Keyword::FROM)?;
+        let cursor_name = p.parse_identifier_non_reserved()?;
+        impl_parse_to!(with_properties: WithProperties, p);
+
+        Ok(Self {
+            cursor_name,
+            count,
+            with_properties,
+        })
+    }
+}
+
+impl fmt::Display for FetchCursorStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut v: Vec<String> = vec![];
+        if self.count == 1 {
+            v.push("NEXT ".to_owned());
+        } else {
+            impl_fmt_display!(count, v, self);
+        }
+        v.push("FROM ".to_owned());
+        impl_fmt_display!(cursor_name, v, self);
+        v.iter().join(" ").fmt(f)
+    }
+}
+
+// sql_grammar!(CloseCursorStatement {
+//     cursor_name: Ident,
+// });
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CloseCursorStatement {
+    pub cursor_name: Option<Ident>,
+}
+
+impl ParseTo for CloseCursorStatement {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
+        let cursor_name = if p.parse_keyword(Keyword::ALL) {
+            None
+        } else {
+            Some(p.parse_identifier_non_reserved()?)
+        };
+
+        Ok(Self { cursor_name })
+    }
+}
+
+impl fmt::Display for CloseCursorStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut v: Vec<String> = vec![];
+        if let Some(cursor_name) = &self.cursor_name {
+            v.push(format!("{}", cursor_name));
+        } else {
+            v.push("ALL".to_owned());
+        }
+        v.iter().join(" ").fmt(f)
+    }
+}
+
 // sql_grammar!(CreateConnectionStatement {
 //     if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS],
 //     connection_name: Ident,
 //     with_properties: AstOption<WithProperties>,
 // });
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CreateConnectionStatement {
     pub if_not_exists: bool,
     pub connection_name: ObjectName,
@@ -648,14 +821,12 @@ pub struct CreateConnectionStatement {
 }
 
 impl ParseTo for CreateConnectionStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!(if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS], p);
         impl_parse_to!(connection_name: ObjectName, p);
         impl_parse_to!(with_properties: WithProperties, p);
         if with_properties.0.is_empty() {
-            return Err(ParserError::ParserError(
-                "connection properties not provided".to_string(),
-            ));
+            parser_err!("connection properties not provided");
         }
 
         Ok(Self {
@@ -677,21 +848,50 @@ impl fmt::Display for CreateConnectionStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct AstVec<T>(pub Vec<T>);
+pub struct CreateSecretStatement {
+    pub if_not_exists: bool,
+    pub secret_name: ObjectName,
+    pub credential: Value,
+    pub with_properties: WithProperties,
+}
 
-impl<T: fmt::Display> fmt::Display for AstVec<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.iter().join(" ").fmt(f)
+impl ParseTo for CreateSecretStatement {
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self> {
+        impl_parse_to!(if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS], parser);
+        impl_parse_to!(secret_name: ObjectName, parser);
+        impl_parse_to!(with_properties: WithProperties, parser);
+        let mut credential = Value::Null;
+        if parser.parse_keyword(Keyword::AS) {
+            credential = parser.ensure_parse_value()?;
+        }
+        Ok(Self {
+            if_not_exists,
+            secret_name,
+            credential,
+            with_properties,
+        })
+    }
+}
+
+impl fmt::Display for CreateSecretStatement {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut v: Vec<String> = vec![];
+        impl_fmt_display!(if_not_exists => [Keyword::IF, Keyword::NOT, Keyword::EXISTS], v, self);
+        impl_fmt_display!(secret_name, v, self);
+        impl_fmt_display!(with_properties, v, self);
+        if self.credential != Value::Null {
+            v.push("AS".to_owned());
+            impl_fmt_display!(credential, v, self);
+        }
+        v.iter().join(" ").fmt(f)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct WithProperties(pub Vec<SqlOption>);
 
 impl ParseTo for WithProperties {
-    fn parse_to(parser: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self> {
         Ok(Self(
             parser.parse_options_with_preceding_keyword(Keyword::WITH)?,
         ))
@@ -709,13 +909,32 @@ impl fmt::Display for WithProperties {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Since {
+    TimestampMsNum(u64),
+    ProcessTime,
+    Begin,
+    Full,
+}
+
+impl fmt::Display for Since {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use Since::*;
+        match self {
+            TimestampMsNum(ts) => write!(f, " SINCE {}", ts),
+            ProcessTime => write!(f, " SINCE PROCTIME()"),
+            Begin => write!(f, " SINCE BEGIN()"),
+            Full => write!(f, " FULL"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowSchemaLocation {
     pub value: AstString,
 }
 
 impl ParseTo for RowSchemaLocation {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!([Keyword::ROW, Keyword::SCHEMA, Keyword::LOCATION], p);
         impl_parse_to!(value: AstString, p);
         Ok(Self { value })
@@ -734,11 +953,10 @@ impl fmt::Display for RowSchemaLocation {
 /// String literal. The difference with String is that it is displayed with
 /// single-quotes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AstString(pub String);
 
 impl ParseTo for AstString {
-    fn parse_to(parser: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self> {
         Ok(Self(parser.parse_literal_string()?))
     }
 }
@@ -752,7 +970,6 @@ impl fmt::Display for AstString {
 /// This trait is used to replace `Option` because `fmt::Display` can not be implemented for
 /// `Option<T>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AstOption<T> {
     /// No value
     None,
@@ -761,7 +978,7 @@ pub enum AstOption<T> {
 }
 
 impl<T: ParseTo> ParseTo for AstOption<T> {
-    fn parse_to(parser: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self> {
         match T::parse_to(parser) {
             Ok(t) => Ok(AstOption::Some(t)),
             Err(_) => Ok(AstOption::None),
@@ -788,28 +1005,24 @@ impl<T> From<AstOption<T>> for Option<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CreateUserStatement {
     pub user_name: ObjectName,
     pub with_options: UserOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AlterUserStatement {
     pub user_name: ObjectName,
     pub mode: AlterUserMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum AlterUserMode {
     Options(UserOptions),
     Rename(ObjectName),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum UserOption {
     SuperUser,
     NoSuperUser,
@@ -819,6 +1032,8 @@ pub enum UserOption {
     NoCreateUser,
     Login,
     NoLogin,
+    Admin,
+    NoAdmin,
     EncryptedPassword(AstString),
     Password(Option<AstString>),
     OAuth(Vec<SqlOption>),
@@ -835,6 +1050,8 @@ impl fmt::Display for UserOption {
             UserOption::NoCreateUser => write!(f, "NOCREATEUSER"),
             UserOption::Login => write!(f, "LOGIN"),
             UserOption::NoLogin => write!(f, "NOLOGIN"),
+            UserOption::Admin => write!(f, "ADMIN"),
+            UserOption::NoAdmin => write!(f, "NOADMIN"),
             UserOption::EncryptedPassword(p) => write!(f, "ENCRYPTED PASSWORD {}", p),
             UserOption::Password(None) => write!(f, "PASSWORD NULL"),
             UserOption::Password(Some(p)) => write!(f, "PASSWORD {}", p),
@@ -846,7 +1063,6 @@ impl fmt::Display for UserOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct UserOptions(pub Vec<UserOption>);
 
 #[derive(Default)]
@@ -855,6 +1071,7 @@ struct UserOptionsBuilder {
     create_db: Option<UserOption>,
     create_user: Option<UserOption>,
     login: Option<UserOption>,
+    admin: Option<UserOption>,
     password: Option<UserOption>,
 }
 
@@ -873,6 +1090,9 @@ impl UserOptionsBuilder {
         if let Some(option) = self.login {
             options.push(option);
         }
+        if let Some(option) = self.admin {
+            options.push(option);
+        }
         if let Some(option) = self.password {
             options.push(option);
         }
@@ -881,17 +1101,14 @@ impl UserOptionsBuilder {
 }
 
 impl ParseTo for UserOptions {
-    fn parse_to(parser: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self> {
         let mut builder = UserOptionsBuilder::default();
         let add_option = |item: &mut Option<UserOption>, user_option| {
             let old_value = item.replace(user_option);
             if old_value.is_some() {
-                Err(ParserError::ParserError(
-                    "conflicting or redundant options".to_string(),
-                ))
-            } else {
-                Ok(())
+                parser_err!("conflicting or redundant options");
             }
+            Ok(())
         };
         let _ = parser.parse_keyword(Keyword::WITH);
         loop {
@@ -900,55 +1117,49 @@ impl ParseTo for UserOptions {
                 break;
             }
 
-            if let Token::Word(ref w) = token.token {
-                parser.next_token();
-                let (item_mut_ref, user_option) = match w.keyword {
-                    Keyword::SUPERUSER => (&mut builder.super_user, UserOption::SuperUser),
-                    Keyword::NOSUPERUSER => (&mut builder.super_user, UserOption::NoSuperUser),
-                    Keyword::CREATEDB => (&mut builder.create_db, UserOption::CreateDB),
-                    Keyword::NOCREATEDB => (&mut builder.create_db, UserOption::NoCreateDB),
-                    Keyword::CREATEUSER => (&mut builder.create_user, UserOption::CreateUser),
-                    Keyword::NOCREATEUSER => (&mut builder.create_user, UserOption::NoCreateUser),
-                    Keyword::LOGIN => (&mut builder.login, UserOption::Login),
-                    Keyword::NOLOGIN => (&mut builder.login, UserOption::NoLogin),
-                    Keyword::PASSWORD => {
-                        if parser.parse_keyword(Keyword::NULL) {
-                            (&mut builder.password, UserOption::Password(None))
-                        } else {
-                            (
-                                &mut builder.password,
-                                UserOption::Password(Some(AstString::parse_to(parser)?)),
-                            )
-                        }
-                    }
-                    Keyword::ENCRYPTED => {
-                        parser.expect_keyword(Keyword::PASSWORD)?;
+            let option = parser.parse_identifier()?;
+            let s = option.real_value();
+            let (item_mut_ref, user_option) = match &s[..] {
+                "superuser" => (&mut builder.super_user, UserOption::SuperUser),
+                "nosuperuser" => (&mut builder.super_user, UserOption::NoSuperUser),
+                "createdb" => (&mut builder.create_db, UserOption::CreateDB),
+                "nocreatedb" => (&mut builder.create_db, UserOption::NoCreateDB),
+                "createuser" => (&mut builder.create_user, UserOption::CreateUser),
+                "nocreateuser" => (&mut builder.create_user, UserOption::NoCreateUser),
+                "login" => (&mut builder.login, UserOption::Login),
+                "nologin" => (&mut builder.login, UserOption::NoLogin),
+                "admin" => (&mut builder.admin, UserOption::Admin),
+                "noadmin" => (&mut builder.admin, UserOption::NoAdmin),
+                "password" => {
+                    if parser.parse_keyword(Keyword::NULL) {
+                        (&mut builder.password, UserOption::Password(None))
+                    } else {
                         (
                             &mut builder.password,
-                            UserOption::EncryptedPassword(AstString::parse_to(parser)?),
+                            UserOption::Password(Some(AstString::parse_to(parser)?)),
                         )
                     }
-                    Keyword::OAUTH => {
-                        let options = parser.parse_options()?;
-                        (&mut builder.password, UserOption::OAuth(options))
+                }
+                "encrypted" => {
+                    let option = parser.parse_identifier()?;
+                    let s = option.real_value();
+                    if s != "password" {
+                        parser_err!("expected PASSWORD after ENCRYPTED, found {}", option);
                     }
-                    _ => {
-                        parser.expected(
-                            "SUPERUSER | NOSUPERUSER | CREATEDB | NOCREATEDB | LOGIN \
-                            | NOLOGIN | CREATEUSER | NOCREATEUSER | [ENCRYPTED] PASSWORD | NULL | OAUTH",
-                            token,
-                        )?;
-                        unreachable!()
-                    }
-                };
-                add_option(item_mut_ref, user_option)?;
-            } else {
-                parser.expected(
-                    "SUPERUSER | NOSUPERUSER | CREATEDB | NOCREATEDB | LOGIN | NOLOGIN \
-                        | CREATEUSER | NOCREATEUSER | [ENCRYPTED] PASSWORD | NULL | OAUTH",
-                    token,
-                )?
-            }
+                    (
+                        &mut builder.password,
+                        UserOption::EncryptedPassword(AstString::parse_to(parser)?),
+                    )
+                }
+                "oauth" => {
+                    let options = parser.parse_options()?;
+                    (&mut builder.password, UserOption::OAuth(options))
+                }
+                _ => {
+                    parser_err!("unexpected user option: {}", option);
+                }
+            };
+            add_option(item_mut_ref, user_option)?;
         }
         Ok(builder.build())
     }
@@ -965,7 +1176,7 @@ impl fmt::Display for UserOptions {
 }
 
 impl ParseTo for CreateUserStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!(user_name: ObjectName, p);
         impl_parse_to!(with_options: UserOptions, p);
 
@@ -1008,7 +1219,7 @@ impl fmt::Display for AlterUserStatement {
 }
 
 impl ParseTo for AlterUserStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!(user_name: ObjectName, p);
         impl_parse_to!(mode: AlterUserMode, p);
 
@@ -1017,7 +1228,7 @@ impl ParseTo for AlterUserStatement {
 }
 
 impl ParseTo for AlterUserMode {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         if p.parse_keyword(Keyword::RENAME) {
             p.expect_keyword(Keyword::TO)?;
             impl_parse_to!(new_name: ObjectName, p);
@@ -1030,7 +1241,6 @@ impl ParseTo for AlterUserMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DropStatement {
     /// The type of the object to drop: TABLE, VIEW, etc.
     pub object_type: ObjectType,
@@ -1050,7 +1260,7 @@ pub struct DropStatement {
 //     drop_mode: AstOption<DropMode>,
 // });
 impl ParseTo for DropStatement {
-    fn parse_to(p: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(p: &mut Parser<'_>) -> ModalResult<Self> {
         impl_parse_to!(object_type: ObjectType, p);
         impl_parse_to!(if_exists => [Keyword::IF, Keyword::EXISTS], p);
         let object_name = p.parse_object_name()?;
@@ -1076,20 +1286,19 @@ impl fmt::Display for DropStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum DropMode {
     Cascade,
     Restrict,
 }
 
 impl ParseTo for DropMode {
-    fn parse_to(parser: &mut Parser) -> Result<Self, ParserError> {
+    fn parse_to(parser: &mut Parser<'_>) -> ModalResult<Self> {
         let drop_mode = if parser.parse_keyword(Keyword::CASCADE) {
             DropMode::Cascade
         } else if parser.parse_keyword(Keyword::RESTRICT) {
             DropMode::Restrict
         } else {
-            return parser.expected("CASCADE | RESTRICT", parser.peek_token());
+            return parser.expected("CASCADE | RESTRICT");
         };
         Ok(drop_mode)
     }

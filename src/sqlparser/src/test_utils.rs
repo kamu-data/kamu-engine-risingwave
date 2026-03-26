@@ -15,15 +15,7 @@
 /// on this module, as it will change without notice.
 // Integration tests (i.e. everything under `tests/`) import this
 // via `tests/test_utils/executor`.
-
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-use core::fmt::Debug;
+use std::fmt::Debug;
 
 use crate::ast::*;
 use crate::parser::{Parser, ParserError};
@@ -31,11 +23,11 @@ use crate::tokenizer::Tokenizer;
 
 pub fn run_parser_method<F, T: Debug + PartialEq>(sql: &str, f: F) -> T
 where
-    F: Fn(&mut Parser) -> T,
+    F: Fn(&mut Parser<'_>) -> T,
 {
     let mut tokenizer = Tokenizer::new(sql);
     let tokens = tokenizer.tokenize_with_location().unwrap();
-    f(&mut Parser::new(tokens))
+    f(&mut Parser(&tokens))
 }
 
 pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, ParserError> {
@@ -45,6 +37,7 @@ pub fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, ParserError> {
 }
 
 /// Ensures that `sql` parses as a single statement and returns it.
+///
 /// If non-empty `canonical` SQL representation is provided,
 /// additionally asserts that parsing `sql` results in the same parse
 /// tree as parsing `canonical`, and that serializing it back to string
@@ -110,10 +103,11 @@ pub fn verified_expr(sql: &str) -> Expr {
 
 pub fn only<T>(v: impl IntoIterator<Item = T>) -> T {
     let mut iter = v.into_iter();
-    if let (Some(item), None) = (iter.next(), iter.next()) {
-        item
-    } else {
-        panic!("only called on collection without exactly one item")
+    match (iter.next(), iter.next()) {
+        (Some(item), None) => item,
+        _ => {
+            panic!("only called on collection without exactly one item")
+        }
     }
 }
 

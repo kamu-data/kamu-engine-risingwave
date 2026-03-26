@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,11 @@ use std::fmt::{Debug, Formatter};
 use futures::StreamExt;
 use risingwave_common::array::DataChunk;
 use risingwave_expr::expr_context::capture_expr_context;
-use risingwave_pb::batch_plan::exchange_source::LocalExecutePlan::{self, Plan};
 use risingwave_pb::batch_plan::TaskOutputId;
+use risingwave_pb::batch_plan::exchange_source::LocalExecutePlan::{self, Plan};
 use risingwave_pb::task_service::{ExecuteRequest, GetDataResponse};
 use risingwave_rpc_client::ComputeClient;
+use risingwave_rpc_client::error::RpcError;
 use tonic::Streaming;
 
 use crate::error::Result;
@@ -49,7 +50,6 @@ impl GrpcExchangeSource {
                 let execute_request = ExecuteRequest {
                     task_id: Some(task_id),
                     plan: plan.plan,
-                    epoch: plan.epoch,
                     tracing_context: plan.tracing_context,
                     expr_context: Some(capture_expr_context()?),
                 };
@@ -81,12 +81,11 @@ impl ExchangeSource for GrpcExchangeSource {
             }
             Some(r) => r,
         };
-        let task_data = res?;
-        let data = DataChunk::from_protobuf(task_data.get_record_batch()?)?.compact();
+        let task_data = res.map_err(RpcError::from_batch_status)?;
+        let data = DataChunk::from_protobuf(task_data.get_record_batch()?)?.compact_vis();
         trace!(
             "Receiver taskOutput = {:?}, data = {:?}",
-            self.task_output_id,
-            data
+            self.task_output_id, data
         );
 
         Ok(Some(data))

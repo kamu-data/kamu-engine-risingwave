@@ -16,7 +16,6 @@ use std::ops::{Deref, DerefMut};
 
 use super::{EstimateSize, KvSize};
 
-pub mod lru;
 pub mod vecdeque;
 pub use vecdeque::EstimatedVecDeque;
 pub mod hashmap;
@@ -86,7 +85,7 @@ where
     }
 }
 
-impl<'a, V, S> Drop for MutGuard<'a, V, S>
+impl<V, S> Drop for MutGuard<'_, V, S>
 where
     V: EstimateSize,
     S: private::GenericKvSize,
@@ -97,7 +96,7 @@ where
     }
 }
 
-impl<'a, V, S> Deref for MutGuard<'a, V, S>
+impl<V, S> Deref for MutGuard<'_, V, S>
 where
     V: EstimateSize,
     S: private::GenericKvSize,
@@ -109,7 +108,7 @@ where
     }
 }
 
-impl<'a, V, S> DerefMut for MutGuard<'a, V, S>
+impl<V, S> DerefMut for MutGuard<'_, V, S>
 where
     V: EstimateSize,
     S: private::GenericKvSize,

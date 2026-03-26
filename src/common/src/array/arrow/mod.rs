@@ -1,10 +1,10 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -12,12 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod arrow_default;
+// These mods imports arrow_impl.rs to provide FromArrow, ToArrow traits for corresponding arrow versions,
+// and the default From/To implementations.
+
+mod arrow_54;
+mod arrow_56;
+mod arrow_57;
+// These mods import mods above and may override some methods.
 mod arrow_deltalake;
 mod arrow_iceberg;
+mod arrow_udf;
 
-pub use arrow_default::{
-    to_record_batch_with_schema, ToArrowArrayWithTypeConvert, ToArrowTypeConvert,
+pub use arrow_deltalake::DeltaLakeConvert;
+pub use arrow_iceberg::{
+    ICEBERG_DECIMAL_PRECISION, ICEBERG_DECIMAL_SCALE, IcebergArrowConvert,
+    IcebergCreateTableArrowConvert,
 };
-pub use arrow_deltalake::to_deltalake_record_batch_with_schema;
-pub use arrow_iceberg::{iceberg_to_arrow_type, to_iceberg_record_batch_with_schema};
+pub use arrow_udf::UdfArrowConvert;
+pub use reexport::*;
+/// For other RisingWave crates, they can directly use arrow re-exported here, without adding
+/// `arrow` dependencies in their `Cargo.toml`. And they don't need to care about the version.
+mod reexport {
+    pub use super::arrow_56::{
+        FromArrow as Arrow56FromArrow, ToArrow as Arrow56ToArrow, arrow_array as arrow_array_56,
+        arrow_buffer as arrow_buffer_56, arrow_cast as arrow_cast_56,
+        arrow_schema as arrow_schema_56,
+    };
+    pub use super::arrow_57::{
+        FromArrow as Arrow57FromArrow, ToArrow as Arrow57ToArrow, arrow_array as arrow_array_57,
+        arrow_buffer as arrow_buffer_57, arrow_cast as arrow_cast_57,
+        arrow_schema as arrow_schema_57,
+    };
+    pub use super::arrow_deltalake::{
+        FromArrow as DeltaLakeFromArrow, ToArrow as DeltaLakeToArrow,
+        arrow_array as arrow_array_deltalake, arrow_buffer as arrow_buffer_deltalake,
+        arrow_cast as arrow_cast_deltalake, arrow_schema as arrow_schema_deltalake,
+    };
+    pub use super::arrow_iceberg::{
+        FromArrow as IcebergFromArrow, ToArrow as IcebergToArrow,
+        arrow_array as arrow_array_iceberg, arrow_buffer as arrow_buffer_iceberg,
+        arrow_cast as arrow_cast_iceberg, arrow_schema as arrow_schema_iceberg,
+        is_parquet_schema_match_source_schema,
+    };
+    pub use super::arrow_udf::{
+        FromArrow as UdfFromArrow, ToArrow as UdfToArrow, arrow_array as arrow_array_udf,
+        arrow_buffer as arrow_buffer_udf, arrow_cast as arrow_cast_udf,
+        arrow_schema as arrow_schema_udf,
+    };
+}

@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,34 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::anyhow;
 use await_tree::InstrumentAwait;
+use futures::FutureExt;
 use futures::future::join_all;
 use hytra::TrAdder;
-use risingwave_common::log::LogSuppresser;
-use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
+use risingwave_common::bitmap::Bitmap;
+use risingwave_common::config::StreamingConfig;
+use risingwave_common::hash::VirtualNode;
+use risingwave_common::log::LogSuppressor;
+use risingwave_common::metrics::{GLOBAL_ERROR_METRICS, IntGaugeExt};
 use risingwave_common::util::epoch::EpochPair;
-use risingwave_expr::expr_context::{expr_context_scope, FRAGMENT_ID};
 use risingwave_expr::ExprError;
+use risingwave_expr::expr_context::{FRAGMENT_ID, VNODE_COUNT, expr_context_scope};
+use risingwave_pb::id::SubscriberId;
 use risingwave_pb::plan_common::ExprContext;
-use risingwave_pb::stream_plan::PbStreamActor;
+use risingwave_pb::stream_service::inject_barrier_request::BuildActorInfo;
+use risingwave_pb::stream_service::inject_barrier_request::build_actor_info::UpstreamActors;
+use risingwave_rpc_client::MetaClient;
 use thiserror_ext::AsReport;
 use tokio_stream::StreamExt;
 use tracing::Instrument;
 
+use super::StreamConsumer;
 use super::monitor::StreamingMetrics;
 use super::subtask::SubtaskHandle;
-use super::StreamConsumer;
+use crate::CONFIG;
 use crate::error::StreamResult;
-use crate::task::{ActorId, LocalBarrierManager};
+use crate::task::{ActorId, FragmentId, LocalBarrierManager, StreamEnvironment};
 
 /// Shared by all operators of an actor.
 pub struct ActorContext {
     pub id: ActorId,
-    pub fragment_id: u32,
+    pub fragment_id: FragmentId,
+    pub vnode_count: usize,
     pub mview_definition: String,
 
     // TODO(eric): these seem to be useless now?
@@ -49,48 +59,85 @@ pub struct ActorContext {
 
     pub streaming_metrics: Arc<StreamingMetrics>,
 
-    pub dispatch_num: usize,
+    /// This is the number of dispatchers when the actor is created. It will not be updated during runtime when new downstreams are added.
+    pub initial_dispatch_num: usize,
+    // mv_table_id to subscription id
+    pub initial_subscriber_ids: HashSet<SubscriberId>,
+    pub initial_upstream_actors: HashMap<FragmentId, UpstreamActors>,
+
+    // Meta client. currently used for auto schema change. `None` for test only
+    pub meta_client: Option<MetaClient>,
+
+    /// The local streaming configuration for this specific actor.
+    ///
+    /// Compared to `stream_env.global_config`, this config can have some entries overridden by the user.
+    pub config: Arc<StreamingConfig>,
+
+    pub stream_env: StreamEnvironment,
 }
 
 pub type ActorContextRef = Arc<ActorContext>;
 
 impl ActorContext {
-    pub fn for_test(id: ActorId) -> ActorContextRef {
+    pub fn for_test(id: impl Into<ActorId>) -> ActorContextRef {
         Arc::new(Self {
-            id,
-            fragment_id: 0,
-            mview_definition: "".to_string(),
+            id: id.into(),
+            fragment_id: 0.into(),
+            vnode_count: VirtualNode::COUNT_FOR_TEST,
+            mview_definition: "".to_owned(),
             cur_mem_val: Arc::new(0.into()),
             last_mem_val: Arc::new(0.into()),
             total_mem_val: Arc::new(TrAdder::new()),
             streaming_metrics: Arc::new(StreamingMetrics::unused()),
             // Set 1 for test to enable sanity check on table
-            dispatch_num: 1,
+            initial_dispatch_num: 1,
+            initial_subscriber_ids: Default::default(),
+            initial_upstream_actors: Default::default(),
+            meta_client: None,
+            config: Arc::new(StreamingConfig::default()),
+            stream_env: StreamEnvironment::for_test(),
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
-        stream_actor: &PbStreamActor,
+        stream_actor: &BuildActorInfo,
+        fragment_id: FragmentId,
         total_mem_val: Arc<TrAdder<i64>>,
         streaming_metrics: Arc<StreamingMetrics>,
-        dispatch_num: usize,
+        meta_client: Option<MetaClient>,
+        config: Arc<StreamingConfig>,
+        stream_env: StreamEnvironment,
     ) -> ActorContextRef {
         Arc::new(Self {
             id: stream_actor.actor_id,
-            fragment_id: stream_actor.fragment_id,
+            fragment_id,
             mview_definition: stream_actor.mview_definition.clone(),
+            vnode_count: (stream_actor.vnode_bitmap.as_ref())
+                // An unset `vnode_bitmap` means the actor is a singleton,
+                // where only `SINGLETON_VNODE` is set.
+                .map_or(1, |b| Bitmap::from(b).len()),
             cur_mem_val: Arc::new(0.into()),
             last_mem_val: Arc::new(0.into()),
             total_mem_val,
             streaming_metrics,
-            dispatch_num,
+            initial_dispatch_num: stream_actor.dispatchers.len(),
+            initial_subscriber_ids: stream_actor
+                .initial_subscriber_ids
+                .iter()
+                .copied()
+                .collect(),
+            initial_upstream_actors: stream_actor.fragment_upstreams.clone(),
+            meta_client,
+            config,
+            stream_env,
         })
     }
 
     pub fn on_compute_error(&self, err: ExprError, identity: &str) {
-        static LOG_SUPPERSSER: LazyLock<LogSuppresser> = LazyLock::new(LogSuppresser::default);
-        if let Ok(suppressed_count) = LOG_SUPPERSSER.check() {
-            tracing::error!(identity, error = %err.as_report(), suppressed_count, "failed to evaluate expression");
+        static LOG_SUPPRESSOR: LazyLock<LogSuppressor> = LazyLock::new(LogSuppressor::default);
+        if let Ok(suppressed_count) = LOG_SUPPRESSOR.check() {
+            tracing::error!(target: "stream_expr_error", identity, error = %err.as_report(), suppressed_count, "failed to evaluate expression");
         }
 
         let executor_name = identity.split(' ').next().unwrap_or("name_not_found");
@@ -126,7 +173,6 @@ pub struct Actor<C> {
     /// The subtasks to execute concurrently.
     subtasks: Vec<SubtaskHandle>,
 
-    _metrics: Arc<StreamingMetrics>,
     pub actor_context: ActorContextRef,
     expr_context: ExprContext,
     barrier_manager: LocalBarrierManager,
@@ -139,7 +185,7 @@ where
     pub fn new(
         consumer: C,
         subtasks: Vec<SubtaskHandle>,
-        metrics: Arc<StreamingMetrics>,
+        _metrics: Arc<StreamingMetrics>,
         actor_context: ActorContextRef,
         expr_context: ExprContext,
         barrier_manager: LocalBarrierManager,
@@ -147,7 +193,6 @@ where
         Self {
             consumer,
             subtasks,
-            _metrics: metrics,
             actor_context,
             expr_context,
             barrier_manager,
@@ -156,18 +201,28 @@ where
 
     #[inline(always)]
     pub async fn run(mut self) -> StreamResult<()> {
-        FRAGMENT_ID::scope(
-            self.actor_context.fragment_id,
-            expr_context_scope(self.expr_context.clone(), async move {
-                tokio::join!(
-                    // Drive the subtasks concurrently.
-                    join_all(std::mem::take(&mut self.subtasks)),
-                    self.run_consumer(),
-                )
-                .1
-            }),
-        )
-        .await
+        let expr_context = self.expr_context.clone();
+        let fragment_id = self.actor_context.fragment_id;
+        let vnode_count = self.actor_context.vnode_count;
+        let config = self.actor_context.config.clone();
+
+        let run = async move {
+            tokio::join!(
+                // Drive the subtasks concurrently.
+                join_all(std::mem::take(&mut self.subtasks)),
+                self.run_consumer(),
+            )
+            .1
+        }
+        .boxed();
+
+        // Attach contexts to the future.
+        let run = expr_context_scope(expr_context, run);
+        let run = FRAGMENT_ID::scope(fragment_id, run);
+        let run = VNODE_COUNT::scope(vnode_count, run);
+        let run = CONFIG.scope(config, run);
+
+        run.await
     }
 
     async fn run_consumer(self) -> StreamResult<()> {
@@ -177,7 +232,6 @@ where
         .into()));
 
         let id = self.actor_context.id;
-
         let span_name = format!("Actor {id}");
 
         let new_span = |epoch: Option<EpochPair>| {
@@ -185,12 +239,28 @@ where
                 parent: None,
                 "actor",
                 "otel.name" = span_name,
-                actor_id = id,
+                actor_id = %id,
                 prev_epoch = epoch.map(|e| e.prev),
                 curr_epoch = epoch.map(|e| e.curr),
             )
         };
         let mut span = new_span(None);
+
+        let actor_count = self
+            .actor_context
+            .streaming_metrics
+            .actor_count
+            .with_guarded_label_values(&[&self.actor_context.fragment_id.to_string()]);
+        let _actor_count_guard = actor_count.inc_guard();
+
+        let current_epoch = self
+            .actor_context
+            .streaming_metrics
+            .actor_current_epoch
+            .with_guarded_label_values(&[
+                &self.actor_context.id.to_string(),
+                &self.actor_context.fragment_id.to_string(),
+            ]);
 
         let mut last_epoch: Option<EpochPair> = None;
         let mut stream = Box::pin(Box::new(self.consumer).execute());
@@ -201,7 +271,9 @@ where
                 .try_next()
                 .instrument(span.clone())
                 .instrument_await(
-                    last_epoch.map_or("Epoch <initial>".into(), |e| format!("Epoch {}", e.curr)),
+                    last_epoch.map_or(await_tree::span!("Epoch <initial>"), |e| {
+                        await_tree::span!("Epoch {}", e.curr)
+                    }),
                 )
                 .await
             {
@@ -215,13 +287,16 @@ where
             )
             .into()));
 
-            // Collect barriers to local barrier manager
-            self.barrier_manager.collect(id, &barrier);
-
             // Then stop this actor if asked
             if barrier.is_stop(id) {
-                break Ok(());
+                debug!(actor_id = %id, epoch = ?barrier.epoch, "stop at barrier");
+                break Ok(barrier);
             }
+
+            current_epoch.set(barrier.epoch.curr as i64);
+
+            // Collect barriers to local barrier manager
+            self.barrier_manager.collect(id, &barrier);
 
             // Tracing related work
             last_epoch = Some(barrier.epoch);
@@ -230,7 +305,12 @@ where
 
         spawn_blocking_drop_stream(stream).await;
 
-        tracing::trace!(actor_id = id, "actor exit");
+        let result = result.map(|stop_barrier| {
+            // Collect the stop barrier after the stream has been dropped to ensure that all resources
+            self.barrier_manager.collect(id, &stop_barrier);
+        });
+
+        tracing::debug!(actor_id = %id, ok = result.is_ok(), "actor exit");
         result
     }
 }

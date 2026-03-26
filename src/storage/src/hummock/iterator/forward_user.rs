@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,15 +14,16 @@
 
 use std::ops::Bound::*;
 
+use more_asserts::debug_assert_ge;
 use risingwave_common::must_match;
 use risingwave_common::util::epoch::MAX_SPILL_TIMES;
 use risingwave_hummock_sdk::key::{FullKey, FullKeyTracker, UserKey, UserKeyRange};
 use risingwave_hummock_sdk::{EpochWithGap, HummockEpoch};
 
+use crate::hummock::HummockResult;
 use crate::hummock::iterator::{Forward, HummockIterator};
 use crate::hummock::local_version::pinned_version::PinnedVersion;
 use crate::hummock::value::HummockValue;
-use crate::hummock::HummockResult;
 use crate::monitor::StoreLocalStatistic;
 
 /// [`UserIterator`] can be used by user directly.
@@ -124,20 +125,26 @@ impl<I: HummockIterator<Direction = Forward>> UserIterator<I> {
 
         // Handle range scan
         match &self.key_range.0 {
-            Included(begin_key) => {
+            Included(begin_key) | Excluded(begin_key) => {
                 let full_key = FullKey {
-                    user_key: begin_key.clone(),
+                    user_key: begin_key.as_ref(),
                     epoch_with_gap: EpochWithGap::new(self.read_epoch, MAX_SPILL_TIMES),
                 };
-                self.iterator.seek(full_key.to_ref()).await?;
+                self.iterator.seek(full_key).await?;
             }
-            Excluded(_) => unimplemented!("excluded begin key is not supported"),
             Unbounded => {
                 self.iterator.rewind().await?;
             }
         };
 
-        self.try_advance_to_next_valid().await
+        self.try_advance_to_next_valid().await?;
+        if let Excluded(begin_key) = &self.key_range.0
+            && self.is_valid()
+            && self.key().user_key == begin_key.as_ref()
+        {
+            self.next().await?;
+        }
+        Ok(())
     }
 
     /// Resets the iterating position to the first position where the key >= provided key.
@@ -147,8 +154,8 @@ impl<I: HummockIterator<Direction = Forward>> UserIterator<I> {
         self.full_key_tracker = FullKeyTracker::new(FullKey::default());
 
         // Handle range scan when key < begin_key
-        let user_key = match &self.key_range.0 {
-            Included(begin_key) => {
+        let seek_key = match &self.key_range.0 {
+            Included(begin_key) | Excluded(begin_key) => {
                 let begin_key = begin_key.as_ref();
                 if begin_key > user_key {
                     begin_key
@@ -156,17 +163,24 @@ impl<I: HummockIterator<Direction = Forward>> UserIterator<I> {
                     user_key
                 }
             }
-            Excluded(_) => unimplemented!("excluded begin key is not supported"),
             Unbounded => user_key,
         };
 
         let full_key = FullKey {
-            user_key,
+            user_key: seek_key,
             epoch_with_gap: EpochWithGap::new(self.read_epoch, MAX_SPILL_TIMES),
         };
         self.iterator.seek(full_key).await?;
 
-        self.try_advance_to_next_valid().await
+        self.try_advance_to_next_valid().await?;
+        if let Excluded(begin_key) = &self.key_range.0
+            && self.is_valid()
+            && self.key().user_key == begin_key.as_ref()
+        {
+            debug_assert_ge!(begin_key.as_ref(), user_key);
+            self.next().await?;
+        }
+        Ok(())
     }
 
     /// Indicates whether the iterator can be used.
@@ -260,28 +274,28 @@ mod tests {
 
     use bytes::Bytes;
     use risingwave_common::util::epoch::test_epoch;
+    use risingwave_hummock_sdk::sstable_info::SstableInfo;
 
     use super::*;
+    use crate::hummock::TableHolder;
+    use crate::hummock::iterator::MergeIterator;
     use crate::hummock::iterator::test_utils::{
-        default_builder_opt_for_test, gen_iterator_test_sstable_base,
+        TEST_KEYS_COUNT, default_builder_opt_for_test, gen_iterator_test_sstable_base,
         gen_iterator_test_sstable_from_kv_pair, gen_iterator_test_sstable_with_incr_epoch,
         gen_iterator_test_sstable_with_range_tombstones, iterator_test_bytes_key_of,
         iterator_test_bytes_key_of_epoch, iterator_test_bytes_user_key_of, iterator_test_value_of,
-        mock_sstable_store, TEST_KEYS_COUNT,
+        mock_sstable_store,
     };
-    use crate::hummock::iterator::MergeIterator;
     use crate::hummock::sstable::{
         SstableIterator, SstableIteratorReadOptions, SstableIteratorType,
     };
     use crate::hummock::sstable_store::SstableStoreRef;
-    use crate::hummock::value::HummockValue;
-    use crate::hummock::TableHolder;
 
     #[tokio::test]
     async fn test_basic() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
-        let table0 = gen_iterator_test_sstable_base(
+        let (table0, sstable_info_0) = gen_iterator_test_sstable_base(
             0,
             default_builder_opt_for_test(),
             |x| x * 3,
@@ -289,7 +303,7 @@ mod tests {
             TEST_KEYS_COUNT,
         )
         .await;
-        let table1 = gen_iterator_test_sstable_base(
+        let (table1, sstable_info_1) = gen_iterator_test_sstable_base(
             1,
             default_builder_opt_for_test(),
             |x| x * 3 + 1,
@@ -297,7 +311,7 @@ mod tests {
             TEST_KEYS_COUNT,
         )
         .await;
-        let table2 = gen_iterator_test_sstable_base(
+        let (table2, sstable_info_2) = gen_iterator_test_sstable_base(
             2,
             default_builder_opt_for_test(),
             |x| x * 3 + 2,
@@ -306,9 +320,19 @@ mod tests {
         )
         .await;
         let iters = vec![
-            SstableIterator::create(table0, sstable_store.clone(), read_options.clone()),
-            SstableIterator::create(table1, sstable_store.clone(), read_options.clone()),
-            SstableIterator::create(table2, sstable_store, read_options.clone()),
+            SstableIterator::create(
+                table0,
+                sstable_store.clone(),
+                read_options.clone(),
+                &sstable_info_0,
+            ),
+            SstableIterator::create(
+                table1,
+                sstable_store.clone(),
+                read_options.clone(),
+                &sstable_info_1,
+            ),
+            SstableIterator::create(table2, sstable_store, read_options.clone(), &sstable_info_2),
         ];
 
         let mi = MergeIterator::new(iters);
@@ -333,8 +357,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_seek() {
-        let sstable_store = mock_sstable_store();
-        let table0 = gen_iterator_test_sstable_base(
+        let sstable_store = mock_sstable_store().await;
+        let (table0, sstable_info_0) = gen_iterator_test_sstable_base(
             0,
             default_builder_opt_for_test(),
             |x| x * 3,
@@ -342,7 +366,7 @@ mod tests {
             TEST_KEYS_COUNT,
         )
         .await;
-        let table1 = gen_iterator_test_sstable_base(
+        let (table1, sstable_info_1) = gen_iterator_test_sstable_base(
             1,
             default_builder_opt_for_test(),
             |x| x * 3 + 1,
@@ -350,7 +374,7 @@ mod tests {
             TEST_KEYS_COUNT,
         )
         .await;
-        let table2 = gen_iterator_test_sstable_base(
+        let (table2, sstable_info_2) = gen_iterator_test_sstable_base(
             2,
             default_builder_opt_for_test(),
             |x| x * 3 + 2,
@@ -360,9 +384,19 @@ mod tests {
         .await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
         let iters = vec![
-            SstableIterator::create(table0, sstable_store.clone(), read_options.clone()),
-            SstableIterator::create(table1, sstable_store.clone(), read_options.clone()),
-            SstableIterator::create(table2, sstable_store, read_options),
+            SstableIterator::create(
+                table0,
+                sstable_store.clone(),
+                read_options.clone(),
+                &sstable_info_0,
+            ),
+            SstableIterator::create(
+                table1,
+                sstable_store.clone(),
+                read_options.clone(),
+                &sstable_info_1,
+            ),
+            SstableIterator::create(table2, sstable_store, read_options, &sstable_info_2),
         ];
 
         let mi = MergeIterator::new(iters);
@@ -408,27 +442,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
 
         // key=[idx, epoch], value
         let kv_pairs = vec![
             (1, 100, HummockValue::put(iterator_test_value_of(1))),
             (2, 300, HummockValue::delete()),
         ];
-        let table0 =
+        let (table0, sstable_info_0) =
             gen_iterator_test_sstable_from_kv_pair(0, kv_pairs, sstable_store.clone()).await;
 
         let kv_pairs = vec![
             (1, 200, HummockValue::delete()),
             (2, 400, HummockValue::put(iterator_test_value_of(2))),
         ];
-        let table1 =
+        let (table1, sstable_info_1) =
             gen_iterator_test_sstable_from_kv_pair(1, kv_pairs, sstable_store.clone()).await;
 
         let read_options = Arc::new(SstableIteratorReadOptions::default());
         let iters = vec![
-            SstableIterator::create(table0, sstable_store.clone(), read_options.clone()),
-            SstableIterator::create(table1, sstable_store.clone(), read_options),
+            SstableIterator::create(
+                table0,
+                sstable_store.clone(),
+                read_options.clone(),
+                &sstable_info_0,
+            ),
+            SstableIterator::create(table1, sstable_store.clone(), read_options, &sstable_info_1),
         ];
 
         let mi = MergeIterator::new(iters);
@@ -446,7 +485,7 @@ mod tests {
         assert!(!ui.is_valid());
     }
 
-    async fn generate_test_data(sstable_store: SstableStoreRef) -> TableHolder {
+    async fn generate_test_data(sstable_store: SstableStoreRef) -> (TableHolder, SstableInfo) {
         let kv_pairs = vec![
             (0, 200, HummockValue::delete()),
             (0, 100, HummockValue::put(iterator_test_value_of(0))),
@@ -466,20 +505,28 @@ mod tests {
         let sst_info =
             gen_iterator_test_sstable_with_range_tombstones(0, kv_pairs, sstable_store.clone())
                 .await;
-        sstable_store
-            .sstable(&sst_info, &mut StoreLocalStatistic::default())
-            .await
-            .unwrap()
+        (
+            sstable_store
+                .sstable(&sst_info, &mut StoreLocalStatistic::default())
+                .await
+                .unwrap(),
+            sst_info,
+        )
     }
 
     // left..=end
     #[tokio::test]
     async fn test_range_inclusive() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         // key=[idx, epoch], value
-        let table = generate_test_data(sstable_store.clone()).await;
+        let (table, sstable_info) = generate_test_data(sstable_store.clone()).await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
-        let iters = vec![SstableIterator::create(table, sstable_store, read_options)];
+        let iters = vec![SstableIterator::create(
+            table,
+            sstable_store,
+            read_options,
+            &sstable_info,
+        )];
         let mi = MergeIterator::new(iters);
 
         let begin_key = Included(iterator_test_bytes_user_key_of(2));
@@ -537,7 +584,7 @@ mod tests {
     // left..end
     #[tokio::test]
     async fn test_range() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         // key=[idx, epoch], value
         let kv_pairs = vec![
             (0, 200, HummockValue::delete()),
@@ -554,10 +601,15 @@ mod tests {
             (7, 100, HummockValue::put(iterator_test_value_of(7))),
             (8, 100, HummockValue::put(iterator_test_value_of(8))),
         ];
-        let table =
+        let (table, sstable_info) =
             gen_iterator_test_sstable_from_kv_pair(0, kv_pairs, sstable_store.clone()).await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
-        let iters = vec![SstableIterator::create(table, sstable_store, read_options)];
+        let iters = vec![SstableIterator::create(
+            table.clone(),
+            sstable_store.clone(),
+            read_options.clone(),
+            &sstable_info,
+        )];
         let mi = MergeIterator::new(iters);
 
         let begin_key = Included(iterator_test_bytes_user_key_of(2));
@@ -610,17 +662,56 @@ mod tests {
             .await
             .unwrap();
         assert!(!ui.is_valid());
+
+        let iters = vec![SstableIterator::create(
+            table,
+            sstable_store,
+            read_options,
+            &sstable_info,
+        )];
+        let mi = MergeIterator::new(iters);
+
+        let begin_key = Excluded(iterator_test_bytes_user_key_of(2));
+        let end_key = Excluded(iterator_test_bytes_user_key_of(7));
+
+        let mut ui = UserIterator::for_test(mi, (begin_key, end_key));
+        // ----- after-end-range iterate -----
+        ui.seek(iterator_test_bytes_user_key_of(1).as_ref())
+            .await
+            .unwrap();
+        assert!(ui.is_valid());
+        assert_eq!(ui.key(), iterator_test_bytes_key_of_epoch(3, 100).to_ref());
+        ui.seek(iterator_test_bytes_user_key_of(2).as_ref())
+            .await
+            .unwrap();
+        assert!(ui.is_valid());
+        assert_eq!(ui.key(), iterator_test_bytes_key_of_epoch(3, 100).to_ref());
+        ui.seek(iterator_test_bytes_user_key_of(3).as_ref())
+            .await
+            .unwrap();
+        assert!(ui.is_valid());
+        assert_eq!(ui.key(), iterator_test_bytes_key_of_epoch(3, 100).to_ref());
+        ui.seek(iterator_test_bytes_user_key_of(4).as_ref())
+            .await
+            .unwrap();
+        assert!(ui.is_valid());
+        assert_eq!(ui.key(), iterator_test_bytes_key_of_epoch(6, 100).to_ref());
     }
 
     // ..=right
     #[tokio::test]
     async fn test_range_to_inclusive() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         // key=[idx, epoch], value
 
-        let table = generate_test_data(sstable_store.clone()).await;
+        let (table, sstable_info) = generate_test_data(sstable_store.clone()).await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
-        let iters = vec![SstableIterator::create(table, sstable_store, read_options)];
+        let iters = vec![SstableIterator::create(
+            table,
+            sstable_store,
+            read_options,
+            &sstable_info,
+        )];
         let mi = MergeIterator::new(iters);
         let end_key = Included(iterator_test_bytes_user_key_of(7));
 
@@ -680,11 +771,16 @@ mod tests {
     // left..
     #[tokio::test]
     async fn test_range_from() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         // key=[idx, epoch], value
-        let table = generate_test_data(sstable_store.clone()).await;
+        let (table, sstable_info) = generate_test_data(sstable_store.clone()).await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
-        let iters = vec![SstableIterator::create(table, sstable_store, read_options)];
+        let iters = vec![SstableIterator::create(
+            table,
+            sstable_store,
+            read_options,
+            &sstable_info,
+        )];
         let mi = MergeIterator::new(iters);
         let begin_key = Included(iterator_test_bytes_user_key_of(2));
 
@@ -747,9 +843,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_min_epoch() {
-        let sstable_store = mock_sstable_store();
+        let sstable_store = mock_sstable_store().await;
         let read_options = Arc::new(SstableIteratorReadOptions::default());
-        let table0 = gen_iterator_test_sstable_with_incr_epoch(
+        let (table0, sstable_info_0) = gen_iterator_test_sstable_with_incr_epoch(
             0,
             default_builder_opt_for_test(),
             |x| x * 3,
@@ -762,6 +858,7 @@ mod tests {
             table0,
             sstable_store.clone(),
             read_options.clone(),
+            &sstable_info_0,
         )];
 
         let min_count = (TEST_KEYS_COUNT / 5) as u64;

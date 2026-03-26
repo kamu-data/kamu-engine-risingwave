@@ -12,28 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![feature(lazy_cell)]
 #![feature(type_alias_impl_trait)]
 #![feature(impl_trait_in_assoc_type)]
-#![feature(array_methods)]
+#![feature(trait_alias)]
+
 use std::ops::Deref;
 use std::sync::LazyLock;
 
 use hytra::TrAdder;
 use prometheus::core::{Atomic, AtomicU64, GenericCounter, GenericGauge};
+use prometheus::proto::Metric;
 use prometheus::register_int_counter_with_registry;
 use tracing::Subscriber;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 mod error_metrics;
+mod gauge_ext;
 mod guarded_metrics;
+mod metrics;
 pub mod monitor;
 mod relabeled_metric;
 
 pub use error_metrics::*;
+pub use gauge_ext::*;
 pub use guarded_metrics::*;
+pub use metrics::*;
 pub use relabeled_metric::*;
 
 #[derive(Debug)]
@@ -139,4 +144,17 @@ impl PartialOrd for MetricLevel {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         (*self as u8).partial_cmp(&(*other as u8))
     }
+}
+
+pub fn get_label<T: std::str::FromStr>(metric: &Metric, label: &str) -> Option<T> {
+    metric
+        .get_label()
+        .iter()
+        .find(|lp| lp.name() == label)
+        .and_then(|lp| lp.value().parse::<T>().ok())
+}
+
+// Must ensure the label exists and can be parsed into `T`
+pub fn get_label_infallible<T: std::str::FromStr>(metric: &Metric, label: &str) -> T {
+    get_label(metric, label).expect("label not found or can't be parsed")
 }

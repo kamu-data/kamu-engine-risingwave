@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,21 +16,19 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::ops::{Add, Neg, Sub};
 use std::sync::LazyLock;
 
+use anyhow::Context;
 use byteorder::{BigEndian, NetworkEndian, ReadBytesExt, WriteBytesExt};
 use bytes::BytesMut;
-use chrono::Timelike;
 use num_traits::{CheckedAdd, CheckedNeg, CheckedSub, Zero};
-use postgres_types::{to_sql_checked, FromSql};
+use postgres_types::to_sql_checked;
 use regex::Regex;
-use risingwave_common_estimate_size::ZeroHeapSize;
 use risingwave_pb::data::PbInterval;
 use rust_decimal::prelude::Decimal;
 
-use super::to_binary::ToBinary;
 use super::*;
 
 /// Every interval can be represented by a `Interval`.
@@ -230,6 +228,18 @@ impl Interval {
             * (SECS_PER_DAY / 4) as i64;
 
         secs_from_day_month as i128 * USECS_PER_SEC as i128 + self.usecs as i128
+    }
+
+    pub fn from_protobuf(cursor: &mut Cursor<&[u8]>) -> ArrayResult<Interval> {
+        let mut read = || {
+            let months = cursor.read_i32::<BigEndian>()?;
+            let days = cursor.read_i32::<BigEndian>()?;
+            let usecs = cursor.read_i64::<BigEndian>()?;
+
+            Ok::<_, std::io::Error>(Interval::from_month_day_usec(months, days, usecs))
+        };
+
+        Ok(read().context("failed to read Interval from buffer")?)
     }
 
     pub fn to_protobuf<T: Write>(self, output: &mut T) -> ArrayResult<usize> {
@@ -609,7 +619,6 @@ pub mod test_utils {
     }
 
     impl IntervalTestExt for Interval {
-        #[must_use]
         fn from_ymd(year: i32, month: i32, days: i32) -> Self {
             let months = year * 12 + month;
             let usecs = 0;
@@ -620,7 +629,6 @@ pub mod test_utils {
             }
         }
 
-        #[must_use]
         fn from_month(months: i32) -> Self {
             Interval {
                 months,
@@ -628,7 +636,6 @@ pub mod test_utils {
             }
         }
 
-        #[must_use]
         fn from_days(days: i32) -> Self {
             Self {
                 days,
@@ -636,7 +643,6 @@ pub mod test_utils {
             }
         }
 
-        #[must_use]
         fn from_millis(ms: i64) -> Self {
             Self {
                 usecs: ms * 1000,
@@ -644,7 +650,6 @@ pub mod test_utils {
             }
         }
 
-        #[must_use]
         fn from_minutes(minutes: i64) -> Self {
             Self {
                 usecs: USECS_PER_SEC * 60 * minutes,
@@ -1013,7 +1018,9 @@ pub enum IntervalParseError {
     #[error("Invalid interval: {0}")]
     Invalid(String),
 
-    #[error("Invalid interval: {0}, expected format P<years>Y<months>M<days>DT<hours>H<minutes>M<seconds>S")]
+    #[error(
+        "Invalid interval: {0}, expected format P<years>Y<months>M<days>DT<hours>H<minutes>M<seconds>S"
+    )]
     InvalidIso8601(String),
 
     #[error("Invalid unit: {0}")]
@@ -1184,19 +1191,6 @@ impl<'a> FromSql<'a> for Interval {
     }
 }
 
-impl ToBinary for Interval {
-    fn to_binary_with_type(&self, ty: &DataType) -> super::to_binary::Result<Option<Bytes>> {
-        match ty {
-            DataType::Interval => {
-                let mut output = BytesMut::new();
-                self.to_sql(&Type::ANY, &mut output).unwrap();
-                Ok(Some(output.freeze()))
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DateTimeField {
     Year,
@@ -1233,8 +1227,8 @@ enum TimeStrToken {
 fn parse_interval(s: &str) -> ParseResult<Vec<TimeStrToken>> {
     let s = s.trim();
     let mut tokens = Vec::new();
-    let mut num_buf = "".to_string();
-    let mut char_buf = "".to_string();
+    let mut num_buf = "".to_owned();
+    let mut char_buf = "".to_owned();
     let mut hour_min_sec = Vec::new();
     for (i, c) in s.chars().enumerate() {
         match c {
@@ -1254,7 +1248,10 @@ fn parse_interval(s: &str) -> ParseResult<Vec<TimeStrToken>> {
             }
             chr if chr.is_ascii_whitespace() => {
                 convert_unit(&mut char_buf, &mut tokens)?;
-                convert_digit(&mut num_buf, &mut tokens)?;
+                // Skip parsing standalone '+' or '-' signs until they combine with digits.
+                if !matches!(num_buf.as_str(), "-" | "+") {
+                    convert_digit(&mut num_buf, &mut tokens)?;
+                }
             }
             ':' => {
                 // there must be a digit before the ':'
@@ -1267,7 +1264,7 @@ fn parse_interval(s: &str) -> ParseResult<Vec<TimeStrToken>> {
             _ => {
                 return Err(IntervalParseError::uncategorized(format!(
                     "Invalid character at offset {} in {}: {:?}. Only support digit or alphabetic now",
-                    i,s, c
+                    i, s, c
                 )));
             }
         };

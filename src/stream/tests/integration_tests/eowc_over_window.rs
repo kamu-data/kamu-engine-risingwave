@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2023 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use risingwave_expr::aggregate::{AggArgs, AggKind};
+use risingwave_expr::aggregate::{AggArgs, PbAggKind};
 use risingwave_expr::window_function::{Frame, FrameBound, WindowFuncCall, WindowFuncKind};
+use risingwave_stream::common::table::test_utils::gen_pbtable;
 use risingwave_stream::executor::{EowcOverWindowExecutor, EowcOverWindowExecutorArgs};
 
 use crate::prelude::*;
@@ -28,7 +29,7 @@ async fn create_executor<S: StateStore>(
         Field::unnamed(DataType::Int64),   // pk
         Field::unnamed(DataType::Int32),   // x
     ]);
-    let input_pk_indices = vec![2];
+    let input_stream_key = vec![2];
     let partition_key_indices = vec![1];
     let order_key_index = 0;
 
@@ -53,17 +54,21 @@ async fn create_executor<S: StateStore>(
         Schema { fields }
     };
 
-    let state_table = StateTable::new_without_distribution_inconsistent_op(
+    let state_table = StateTable::from_table_catalog_inconsistent_op(
+        &gen_pbtable(
+            TableId::new(1),
+            table_columns,
+            table_order_types,
+            table_pk_indices,
+            0,
+        ),
         store,
-        TableId::new(1),
-        table_columns,
-        table_order_types,
-        table_pk_indices,
+        None,
     )
     .await;
 
     let (tx, source) = MockSource::channel();
-    let source = source.into_executor(input_schema, input_pk_indices.clone());
+    let source = source.into_executor(input_schema, input_stream_key.clone());
     let executor = EowcOverWindowExecutor::new(EowcOverWindowExecutorArgs {
         actor_ctx: ActorContext::for_test(123),
 
@@ -85,16 +90,18 @@ async fn test_over_window() {
     let calls = vec![
         // lag(x, 1)
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::FirstValue),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::FirstValue.into()),
             return_type: DataType::Int32,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows(FrameBound::Preceding(1), FrameBound::Preceding(1)),
         },
         // lead(x, 1)
         WindowFuncCall {
-            kind: WindowFuncKind::Aggregate(AggKind::FirstValue),
-            args: AggArgs::Unary(DataType::Int32, 3),
+            kind: WindowFuncKind::Aggregate(PbAggKind::FirstValue.into()),
             return_type: DataType::Int32,
+            args: AggArgs::from_iter([(DataType::Int32, 3)]),
+            ignore_nulls: false,
             frame: Frame::rows(FrameBound::Following(1), FrameBound::Following(1)),
         },
     ];
@@ -116,13 +123,13 @@ async fn test_over_window() {
 # NOTE: no watermark message here, since watermark(1) was already received
 - !barrier 2
 - recovery
-- !barrier 3
+- !barrier 2
 - !chunk |2
       I  T  I   i
     + 10 p1 103 13
     + 12 p2 202 28
     + 13 p3 301 39
-- !barrier 4
+- !barrier 3
 "###,
         expect![[r#"
             - input: !barrier 1
@@ -156,9 +163,9 @@ async fn test_over_window() {
               - !barrier 2
             - input: recovery
               output: []
-            - input: !barrier 3
+            - input: !barrier 2
               output:
-              - !barrier 3
+              - !barrier 2
             - input: !chunk |-
                 +---+----+----+-----+----+
                 | + | 10 | p1 | 103 | 13 |
@@ -172,9 +179,9 @@ async fn test_over_window() {
                 | + | 7 | p2 | 201 | 22 | 20 | 28 |
                 | + | 8 | p3 | 300 | 33 |    | 39 |
                 +---+---+----+-----+----+----+----+
-            - input: !barrier 4
+            - input: !barrier 3
               output:
-              - !barrier 4
+              - !barrier 3
         "#]],
         SnapshotOptions::default(),
     )
@@ -185,9 +192,10 @@ async fn test_over_window() {
 async fn test_over_window_aggregate() {
     let store = MemoryStateStore::new();
     let calls = vec![WindowFuncCall {
-        kind: WindowFuncKind::Aggregate(AggKind::Sum),
-        args: AggArgs::Unary(DataType::Int32, 3),
+        kind: WindowFuncKind::Aggregate(PbAggKind::Sum.into()),
         return_type: DataType::Int64,
+        args: AggArgs::from_iter([(DataType::Int32, 3)]),
+        ignore_nulls: false,
         frame: Frame::rows(FrameBound::Preceding(1), FrameBound::Following(1)),
     }];
 

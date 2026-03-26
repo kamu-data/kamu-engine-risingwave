@@ -15,9 +15,9 @@
 use std::marker::PhantomData;
 
 use anyhow::Context;
+use opendal::Operator;
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::services::Fs;
-use opendal::Operator;
 
 use super::opendal_enumerator::OpendalEnumerator;
 use super::{OpendalSource, PosixFsProperties};
@@ -31,10 +31,7 @@ impl<Src: OpendalSource> OpendalEnumerator<Src> {
     /// create opendal posix fs source.
     pub fn new_posix_fs_source(posix_fs_properties: PosixFsProperties) -> ConnectorResult<Self> {
         // Create Fs builder.
-        let mut builder = Fs::default();
-
-        builder.root(&posix_fs_properties.root);
-
+        let builder = Fs::default().root(&posix_fs_properties.root);
         let op: Operator = Operator::new(builder)?
             .layer(LoggingLayer::default())
             .layer(RetryLayer::default())
@@ -49,11 +46,13 @@ impl<Src: OpendalSource> OpendalEnumerator<Src> {
         } else {
             (None, None)
         };
+        let compression_format = posix_fs_properties.compression_format;
         Ok(Self {
             op,
             prefix,
             matcher,
             marker: PhantomData,
+            compression_format,
         })
     }
 }

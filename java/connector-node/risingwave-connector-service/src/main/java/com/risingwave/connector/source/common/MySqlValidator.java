@@ -1,29 +1,27 @@
-// Copyright 2024 RisingWave Labs
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Copyright 2023 RisingWave Labs
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 package com.risingwave.connector.source.common;
 
 import com.risingwave.connector.api.TableSchema;
-import com.risingwave.connector.api.source.SourceTypeE;
 import com.risingwave.proto.Data;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
     private final Map<String, String> userProps;
@@ -48,12 +46,15 @@ public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
 
         var dbHost = userProps.get(DbzConnectorConfig.HOST);
         var dbPort = userProps.get(DbzConnectorConfig.PORT);
-        var dbName = userProps.get(DbzConnectorConfig.DB_NAME);
-        var jdbcUrl = ValidatorUtils.getJdbcUrl(SourceTypeE.MYSQL, dbHost, dbPort, dbName);
+        var jdbcUrl = String.format("jdbc:mysql://%s:%s", dbHost, dbPort);
+        var properties = new Properties();
+        properties.setProperty("user", userProps.get(DbzConnectorConfig.USER));
+        properties.setProperty("password", userProps.get(DbzConnectorConfig.PASSWORD));
+        properties.setProperty(
+                "sslMode", userProps.getOrDefault(DbzConnectorConfig.MYSQL_SSL_MODE, "DISABLED"));
+        properties.setProperty("allowPublicKeyRetrieval", "true");
 
-        var user = userProps.get(DbzConnectorConfig.USER);
-        var password = userProps.get(DbzConnectorConfig.PASSWORD);
-        this.jdbcConnection = DriverManager.getConnection(jdbcUrl, user, password);
+        this.jdbcConnection = DriverManager.getConnection(jdbcUrl, properties);
         this.isCdcSourceJob = isCdcSourceJob;
         this.isBackfillTable = isBackfillTable;
     }
@@ -61,7 +62,36 @@ public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
     @Override
     public void validateDbConfig() {
         try {
-            // TODO: check database server version
+            // Check whether MySQL version is less than 8.4,
+            // since MySQL 8.4 introduces some breaking changes:
+            // https://dev.mysql.com/doc/relnotes/mysql/8.4/en/news-8-4-0.html#mysqld-8-4-0-deprecation-removal
+            var major = jdbcConnection.getMetaData().getDatabaseMajorVersion();
+            var minor = jdbcConnection.getMetaData().getDatabaseMinorVersion();
+
+            // if ((major > 8) || (major == 8 && minor >= 4)) {
+            //     throw ValidatorUtils.failedPrecondition("MySQL version should be less than 8.4");
+            // }
+
+            // "database.name" is a comma-separated list of database names
+            var dbNames = userProps.get(DbzConnectorConfig.DB_NAME);
+            for (var dbName : dbNames.split(",")) {
+                // check the existence of the database
+                try (var stmt =
+                        jdbcConnection.prepareStatement(
+                                ValidatorUtils.getSql("mysql.check_db_exist"))) {
+                    stmt.setString(1, dbName.trim());
+                    var res = stmt.executeQuery();
+                    while (res.next()) {
+                        var ret = res.getInt(1);
+                        if (ret == 0) {
+                            throw ValidatorUtils.invalidArgument(
+                                    String.format(
+                                            "MySQL database '%s' doesn't exist", dbName.trim()));
+                        }
+                    }
+                }
+            }
+
             validateBinlogConfig();
         } catch (SQLException e) {
             throw ValidatorUtils.internalError(e.getMessage());
@@ -185,17 +215,41 @@ public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
             stmt.setString(1, dbName);
             stmt.setString(2, tableName);
 
-            // Field name in lower case -> data type
-            var schema = new HashMap<String, String>();
+            // Record charMaxLength for each column
+            class ColumnInfo {
+                String dataType;
+                long charMaxLength; // Use long to avoid overflow for 4294967295
+                String columnType; // Full column type including UNSIGNED modifier
+
+                ColumnInfo(String dataType, long charMaxLength, String columnType) {
+                    this.dataType = dataType;
+                    this.charMaxLength = charMaxLength;
+                    this.columnType = columnType;
+                }
+
+                boolean isUnsigned() {
+                    return columnType != null && columnType.toLowerCase().contains("unsigned");
+                }
+            }
+
+            // field name (lowercase) -> ColumnInfo
+            var upstreamSchema = new HashMap<String, ColumnInfo>();
             var pkFields = new HashSet<String>();
             var res = stmt.executeQuery();
             while (res.next()) {
                 var field = res.getString(1);
                 var dataType = res.getString(2);
                 var key = res.getString(3);
-                schema.put(field.toLowerCase(), dataType);
+                long charMaxLength = res.getLong(4);
+                var columnType = res.getString(5); // Get full column type (e.g., "bigint unsigned")
+                // In MySQL, some types (such as text/blob) will return 4294967295 for
+                // charMaxLength, need special handling
+                if (res.wasNull()) {
+                    charMaxLength = -1;
+                }
+                upstreamSchema.put(
+                        field.toLowerCase(), new ColumnInfo(dataType, charMaxLength, columnType));
                 if (key.equalsIgnoreCase("PRI")) {
-                    // RisingWave always use lower case for column name
                     pkFields.add(field.toLowerCase());
                 }
             }
@@ -206,20 +260,27 @@ public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
                 if (e.getKey().startsWith(ValidatorUtils.INTERNAL_COLUMN_PREFIX)) {
                     continue;
                 }
-                var dataType = schema.get(e.getKey().toLowerCase());
-                if (dataType == null) {
+                var columnInfo = upstreamSchema.get(e.getKey().toLowerCase());
+                if (columnInfo == null) {
                     throw ValidatorUtils.invalidArgument(
                             "Column '" + e.getKey() + "' not found in the upstream database");
                 }
-                if (!isDataTypeCompatible(dataType, e.getValue())) {
+                if (!isDataTypeCompatible(
+                        columnInfo.dataType,
+                        e.getValue(),
+                        columnInfo.charMaxLength,
+                        columnInfo.isUnsigned())) {
                     throw ValidatorUtils.invalidArgument(
-                            "Incompatible data type of column " + e.getKey());
+                            "Incompatible data type of column "
+                                    + e.getKey()
+                                    + ". MySQL type: "
+                                    + columnInfo.columnType
+                                    + ", RisingWave type: "
+                                    + e.getValue());
                 }
             }
 
-            if (!ValidatorUtils.isPrimaryKeyMatch(tableSchema, pkFields)) {
-                throw ValidatorUtils.invalidArgument("Primary key mismatch");
-            }
+            primaryKeyCheck(tableSchema, pkFields);
         }
     }
 
@@ -230,8 +291,74 @@ public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
         }
     }
 
-    private boolean isDataTypeCompatible(String mysqlDataType, Data.DataType.TypeName typeName) {
+    private static void primaryKeyCheck(TableSchema sourceSchema, Set<String> pkFields)
+            throws RuntimeException {
+        if (sourceSchema.getPrimaryKeys().size() != pkFields.size()) {
+            throw ValidatorUtils.invalidArgument(
+                    "Primary key mismatch: the SQL schema defines "
+                            + sourceSchema.getPrimaryKeys().size()
+                            + " primary key columns, but the source table in MySQL has "
+                            + pkFields.size()
+                            + " columns.");
+        }
+        for (var colName : sourceSchema.getPrimaryKeys()) {
+            if (!pkFields.contains(colName.toLowerCase())) {
+                throw ValidatorUtils.invalidArgument(
+                        "Primary key mismatch: The primary key list of the source table in MySQL does not contain '"
+                                + colName
+                                + "'.");
+            }
+        }
+    }
+
+    private boolean isDataTypeCompatible(
+            String mysqlDataType,
+            Data.DataType.TypeName typeName,
+            long charMaxLength,
+            boolean isUnsigned) {
         int val = typeName.getNumber();
+
+        // Special handling for unsigned types
+        // For all MySQL unsigned integer types, the recommended approach is to upcast to a larger
+        // signed type in RisingWave to avoid overflow:
+        //   - unsigned tinyint (u8) -> smallint (i16) or larger
+        //   - unsigned smallint (u16) -> int (i32) or larger
+        //   - unsigned int (u32) -> bigint (i64)
+        //   - unsigned bigint (u64) -> decimal (precise, no overflow)
+        //
+        // Special case for unsigned bigint:
+        // Although the best practice is to use DECIMAL to preserve the full range (0 to 2^64-1),
+        // we also allow unsigned bigint -> bigint mapping. This is because Debezium's default
+        // behavior (without 'debezium.bigint.unsigned.handling.mode=precise') converts MySQL
+        // unsigned bigint to signed i64 in the CDC stream. When values exceed i64::MAX, they
+        // overflow to negative numbers (e.g., 18446251075179777772u64 -> -492998529773844i64).
+        // We intentionally support this conversion for backward compatibility and to handle
+        // existing CDC sources.
+        if (isUnsigned) {
+            switch (mysqlDataType) {
+                case "tinyint": // unsigned tinyint (0-255)
+                    // Allow upcast: tinyint unsigned -> smallint/int/bigint
+                    return Data.DataType.TypeName.INT16_VALUE <= val
+                            && val <= Data.DataType.TypeName.INT64_VALUE;
+                case "smallint": // unsigned smallint (0-65535)
+                    // Allow upcast: smallint unsigned -> int/bigint
+                    return Data.DataType.TypeName.INT32_VALUE <= val
+                            && val <= Data.DataType.TypeName.INT64_VALUE;
+                case "mediumint": // unsigned mediumint (0-16777215)
+                case "int": // unsigned int (0-4294967295)
+                    // Allow upcast: int unsigned -> bigint
+                    return val == Data.DataType.TypeName.INT64_VALUE;
+                case "bigint": // unsigned bigint (0-18446744073709551615)
+                    // Allow: bigint unsigned -> bigint (with overflow) or decimal (precise)
+                    return val == Data.DataType.TypeName.INT64_VALUE
+                            || val == Data.DataType.TypeName.DECIMAL_VALUE;
+                default:
+                    // For other types, fall through to standard validation
+                    break;
+            }
+        }
+
+        // Standard validation for signed types
         switch (mysqlDataType) {
             case "tinyint": // boolean
                 return (val == Data.DataType.TypeName.BOOLEAN_VALUE)
@@ -245,22 +372,60 @@ public class MySqlValidator extends DatabaseValidator implements AutoCloseable {
                 return Data.DataType.TypeName.INT32_VALUE <= val
                         && val <= Data.DataType.TypeName.INT64_VALUE;
             case "bigint":
-                return val == Data.DataType.TypeName.INT64_VALUE;
-
+                return val == Data.DataType.TypeName.INT64_VALUE
+                        || val == Data.DataType.TypeName.DECIMAL_VALUE;
+            case "boolean":
+            case "bool":
+                return val == Data.DataType.TypeName.BOOLEAN_VALUE;
+            case "enum":
+                return val == Data.DataType.TypeName.VARCHAR_VALUE;
+            case "char":
+            case "varchar":
+            case "text":
+            case "tinytext":
+            case "mediumtext":
+                return val == Data.DataType.TypeName.VARCHAR_VALUE;
+            case "longtext":
+                return val == Data.DataType.TypeName.BYTEA_VALUE
+                        || val == Data.DataType.TypeName.VARCHAR_VALUE;
             case "float":
             case "real":
                 return val == Data.DataType.TypeName.FLOAT_VALUE
                         || val == Data.DataType.TypeName.DOUBLE_VALUE;
             case "double":
                 return val == Data.DataType.TypeName.DOUBLE_VALUE;
+            case "numeric":
             case "decimal":
                 return val == Data.DataType.TypeName.DECIMAL_VALUE;
-            case "varchar":
-                return val == Data.DataType.TypeName.VARCHAR_VALUE;
+            case "date":
+                return val == Data.DataType.TypeName.DATE_VALUE;
+            case "time":
+                return val == Data.DataType.TypeName.TIME_VALUE;
+            case "datetime":
+                return val == Data.DataType.TypeName.TIMESTAMP_VALUE;
             case "timestamp":
                 return val == Data.DataType.TypeName.TIMESTAMPTZ_VALUE;
+            case "json":
+                return val == Data.DataType.TypeName.JSONB_VALUE;
+                // For 'bit' type, compatibility depends on charMaxLength
+            case "bit":
+                // bit(1) matches bool, bit(n>1) matches bytea
+                if (charMaxLength == 1) {
+                    return val == Data.DataType.TypeName.BOOLEAN_VALUE;
+                } else {
+                    return val == Data.DataType.TypeName.BYTEA_VALUE;
+                }
+            case "tinyblob":
+            case "blob":
+            case "mediumblob":
+            case "longblob":
+            case "binary":
+            case "varbinary":
+                return val == Data.DataType.TypeName.BYTEA_VALUE;
+            case "year":
+                return val == Data.DataType.TypeName.INT32_VALUE;
             default:
-                return true; // true for other uncovered types
+                return false; // false for other uncovered types
         }
     }
 }

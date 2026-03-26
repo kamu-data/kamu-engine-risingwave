@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,17 +14,13 @@
 
 use std::num::NonZeroUsize;
 
-use futures::StreamExt;
-use futures_async_stream::try_stream;
 use itertools::Itertools;
 use risingwave_common::array::{DataChunk, Op};
 use risingwave_common::types::Interval;
-use risingwave_expr::expr::NonStrictExpression;
 use risingwave_expr::ExprError;
+use risingwave_expr::expr::NonStrictExpression;
 
-use super::error::StreamExecutorError;
-use super::{ActorContextRef, Execute, Executor, Message};
-use crate::common::StreamChunkBuilder;
+use crate::executor::prelude::*;
 
 pub struct HopWindowExecutor {
     _ctx: ActorContextRef,
@@ -122,10 +118,10 @@ impl HopWindowExecutor {
                     }
 
                     // TODO: compact may be not necessary here.
-                    let chunk = chunk.compact();
+                    let chunk = chunk.compact_vis();
                     let (data_chunk, ops) = chunk.into_parts();
                     // SAFETY: Already compacted.
-                    assert!(data_chunk.is_compacted());
+                    assert!(data_chunk.is_vis_compacted());
                     let len = data_chunk.cardinality();
 
                     // Collect each window's data into a chunk.
@@ -230,17 +226,13 @@ impl HopWindowExecutor {
 
 #[cfg(test)]
 mod tests {
-    use futures::StreamExt;
     use risingwave_common::array::stream_chunk::StreamChunkTestExt;
-    use risingwave_common::catalog::{Field, Schema};
+    use risingwave_common::catalog::Field;
     use risingwave_common::types::test_utils::IntervalTestExt;
-    use risingwave_common::types::{DataType, Interval};
     use risingwave_expr::expr::test_utils::make_hop_window_expression;
-    use risingwave_expr::expr::NonStrictExpression;
 
     use super::*;
     use crate::executor::test_utils::MockSource;
-    use crate::executor::{ActorContext, Execute, StreamChunk};
 
     const CHUNK_SIZE: usize = 256;
 
@@ -249,7 +241,7 @@ mod tests {
         let field2 = Field::unnamed(DataType::Int64);
         let field3 = Field::with_name(DataType::Timestamp, "created_at");
         let schema = Schema::new(vec![field1, field2, field3]);
-        let pk_indices = vec![0];
+        let stream_key = vec![0];
 
         let chunk = StreamChunk::from_pretty(
             &"I I TS
@@ -263,8 +255,7 @@ mod tests {
             + 8 3 ^11:02:00"
                 .replace('^', "2022-02-02T"),
         );
-        let input =
-            MockSource::with_chunks(vec![chunk]).into_executor(schema.clone(), pk_indices.clone());
+        let input = MockSource::with_chunks(vec![chunk]).into_executor(schema, stream_key);
         let window_slide = Interval::from_minutes(15);
         let window_size = Interval::from_minutes(30);
         let window_offset = Interval::from_minutes(0);

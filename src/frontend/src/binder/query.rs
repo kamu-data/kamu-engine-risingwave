@@ -1,4 +1,4 @@
-// Copyright 2024 RisingWave Labs
+// Copyright 2022 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use risingwave_common::bail_not_implemented;
 use risingwave_common::catalog::Schema;
 use risingwave_common::types::DataType;
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
-use risingwave_sqlparser::ast::{Cte, Expr, Fetch, OrderByExpr, Query, Value, With};
+use risingwave_sqlparser::ast::{Cte, CteInner, Expr, Fetch, OrderByExpr, Query, Value, With};
 use thiserror_ext::AsReport;
 
-use super::statement::RewriteExprsRecursive;
 use super::BoundValues;
+use super::bind_context::BindingCteState;
+use super::statement::RewriteExprsRecursive;
+use crate::binder::bind_context::BindingCte;
 use crate::binder::{Binder, BoundSetExpr};
-use crate::error::{ErrorCode, Result};
+use crate::error::{ErrorCode, Result, RwError};
 use crate::expr::{CorrelatedId, Depth, ExprImpl, ExprRewriter};
 
 /// A validated sql query, including order and union.
@@ -42,7 +44,7 @@ pub struct BoundQuery {
 
 impl BoundQuery {
     /// The schema returned by this [`BoundQuery`].
-    pub fn schema(&self) -> &Schema {
+    pub fn schema(&self) -> std::borrow::Cow<'_, Schema> {
         self.body.schema()
     }
 
@@ -81,12 +83,20 @@ impl BoundQuery {
     /// * The second example is correlated, because it depend on a correlated input ref (`a1`) that
     ///   goes out.
     /// * The last example is also correlated. because it cannot be evaluated independently either.
-    pub fn is_correlated(&self, depth: Depth) -> bool {
-        self.body.is_correlated(depth + 1)
+    pub fn is_correlated_by_depth(&self, depth: Depth) -> bool {
+        self.body.is_correlated_by_depth(depth + 1)
             || self
                 .extra_order_exprs
                 .iter()
                 .any(|e| e.has_correlated_input_ref_by_depth(depth + 1))
+    }
+
+    pub fn is_correlated_by_correlated_id(&self, correlated_id: CorrelatedId) -> bool {
+        self.body.is_correlated_by_correlated_id(correlated_id)
+            || self
+                .extra_order_exprs
+                .iter()
+                .any(|e| e.has_correlated_input_ref_by_correlated_id(correlated_id))
     }
 
     pub fn collect_correlated_indices_by_depth_and_assign_id(
@@ -139,8 +149,18 @@ impl Binder {
     /// stack and create a new context, because it may be a subquery.
     ///
     /// After finishing binding, we pop the previous context from the stack.
-    pub fn bind_query(&mut self, query: Query) -> Result<BoundQuery> {
+    pub fn bind_query(&mut self, query: &Query) -> Result<BoundQuery> {
         self.push_context();
+        let result = self.bind_query_inner(query);
+        self.pop_context()?;
+        result
+    }
+
+    /// Bind a [`Query`] for view.
+    /// TODO: support `SECURITY INVOKER` for view.
+    pub fn bind_query_for_view(&mut self, query: &Query) -> Result<BoundQuery> {
+        self.push_context();
+        self.context.disable_security_invoker = true;
         let result = self.bind_query_inner(query);
         self.pop_context()?;
         result
@@ -156,7 +176,7 @@ impl Binder {
             limit,
             offset,
             fetch,
-        }: Query,
+        }: &Query,
     ) -> Result<BoundQuery> {
         let mut with_ties = false;
         let limit = match (limit, fetch) {
@@ -168,17 +188,60 @@ impl Binder {
                     quantity,
                 }),
             ) => {
-                with_ties = fetch_with_ties;
+                with_ties = *fetch_with_ties;
                 match quantity {
-                    Some(v) => Some(parse_non_negative_i64("LIMIT", &v)? as u64),
-                    None => Some(1),
+                    Some(v) => Some(Expr::Value(Value::Number(v.clone()))),
+                    None => Some(Expr::Value(Value::Number("1".to_owned()))),
                 }
             }
-            (Some(limit), None) => Some(parse_non_negative_i64("LIMIT", &limit)? as u64),
+            (Some(limit), None) => Some(limit.clone()),
             (Some(_), Some(_)) => unreachable!(), // parse error
         };
+        let limit_expr = limit.map(|expr| self.bind_expr(&expr)).transpose()?;
+        let limit = if let Some(limit_expr) = limit_expr {
+            // wrong type error is handled here
+            let limit_cast_to_bigint = limit_expr.cast_assign(&DataType::Int64).map_err(|_| {
+                RwError::from(ErrorCode::ExprError(
+                    "expects an integer or expression that can be evaluated to an integer after LIMIT"
+                        .into(),
+                ))
+            })?;
+            let limit = match limit_cast_to_bigint.try_fold_const() {
+                Some(Ok(Some(datum))) => {
+                    let value = datum.as_int64();
+                    if *value < 0 {
+                        return Err(ErrorCode::ExprError(
+                            format!("LIMIT must not be negative, but found: {}", *value).into(),
+                        )
+                            .into());
+                    }
+                    *value as u64
+                }
+                // If evaluated to NULL, we follow PG to treat NULL as no limit
+                Some(Ok(None)) => {
+                    u64::MAX
+                }
+                // not const error
+                None => return Err(ErrorCode::ExprError(
+                    "expects an integer or expression that can be evaluated to an integer after LIMIT, but found non-const expression"
+                        .into(),
+                ).into()),
+                // eval error
+                Some(Err(e)) => {
+                    return Err(ErrorCode::ExprError(
+                        format!("expects an integer or expression that can be evaluated to an integer after LIMIT,\nbut the evaluation of the expression returns error:{}", e.as_report()
+                        ).into(),
+                    ).into())
+                }
+            };
+            Some(limit)
+        } else {
+            None
+        };
+
         let offset = offset
-            .map(|s| parse_non_negative_i64("OFFSET", &s))
+            .as_ref()
+            .map(|s| parse_non_negative_i64("OFFSET", s))
             .transpose()?
             .map(|v| v as u64);
 
@@ -191,10 +254,11 @@ impl Binder {
         let mut extra_order_exprs = vec![];
         let visible_output_num = body.schema().len();
         let order = order_by
-            .into_iter()
+            .iter()
             .map(|order_by_expr| {
                 self.bind_order_by_expr_in_query(
                     order_by_expr,
+                    &body,
                     &name_to_index,
                     &mut extra_order_exprs,
                     visible_output_num,
@@ -241,12 +305,24 @@ impl Binder {
             expr,
             asc,
             nulls_first,
-        }: OrderByExpr,
+        }: &OrderByExpr,
+        body: &BoundSetExpr,
         name_to_index: &HashMap<String, usize>,
         extra_order_exprs: &mut Vec<ExprImpl>,
         visible_output_num: usize,
     ) -> Result<ColumnOrder> {
-        let order_type = OrderType::from_bools(asc, nulls_first);
+        let order_type = OrderType::from_bools(*asc, *nulls_first);
+
+        // If the query body is a simple `SELECT`, we can reuse an existing select item by
+        // expression equality, instead of always appending a new hidden column for ORDER BY.
+        //
+        // This is only safe for pure expressions. For example, `ORDER BY random()` must not be
+        // rewritten to reuse `SELECT random()` because they should be evaluated independently.
+        let select_items_for_match = match body {
+            BoundSetExpr::Select(s) => Some(&s.select_items[..]),
+            _ => None,
+        };
+
         let column_index = match expr {
             Expr::Identifier(name) if let Some(index) = name_to_index.get(&name.real_value()) => {
                 match *index != usize::MAX {
@@ -256,7 +332,7 @@ impl Binder {
                             "ORDER BY \"{}\" is ambiguous",
                             name.real_value()
                         ))
-                        .into())
+                        .into());
                     }
                 }
             }
@@ -267,32 +343,80 @@ impl Binder {
                         "Invalid ordinal number in ORDER BY: {}",
                         number
                     ))
-                    .into())
+                    .into());
                 }
             },
             expr => {
-                extra_order_exprs.push(self.bind_expr(expr)?);
-                visible_output_num + extra_order_exprs.len() - 1
+                let bound_expr = self.bind_expr(expr)?;
+
+                if bound_expr.is_pure()
+                    && let Some(select_items) = select_items_for_match
+                    && let Some(existing_idx) = select_items.iter().position(|e| e == &bound_expr)
+                {
+                    existing_idx
+                } else {
+                    extra_order_exprs.push(bound_expr);
+                    visible_output_num + extra_order_exprs.len() - 1
+                }
             }
         };
         Ok(ColumnOrder::new(column_index, order_type))
     }
 
-    fn bind_with(&mut self, with: With) -> Result<()> {
+    fn bind_with(&mut self, with: &With) -> Result<()> {
         if with.recursive {
-            bail_not_implemented!("recursive cte");
-        } else {
-            for cte_table in with.cte_tables {
-                let Cte { alias, query, .. } = cte_table;
-                let table_name = alias.name.real_value();
-                let bound_query = self.bind_query(query)?;
-                let share_id = self.next_share_id();
-                self.context
-                    .cte_to_relation
-                    .insert(table_name, Rc::new((share_id, bound_query, alias)));
-            }
-            Ok(())
+            return Err(ErrorCode::BindError("RECURSIVE CTE is not supported".to_owned()).into());
         }
+
+        let mut cte_names: HashSet<String> = HashSet::new();
+
+        for cte_table in &with.cte_tables {
+            let share_id = self.next_share_id();
+            let Cte { alias, cte_inner } = cte_table;
+            let table_name = alias.name.real_value();
+
+            // Check whether there are duplicate CTE names within the same WITH clause.
+            if cte_names.contains(&table_name) {
+                return Err(ErrorCode::DuplicateRelationName(format!(
+                    "WITH query name \"{}\" specified more than once",
+                    table_name
+                ))
+                .into());
+            }
+
+            cte_names.insert(table_name.clone());
+
+            match cte_inner {
+                CteInner::Query(query) => {
+                    let bound_query = self.bind_query(query)?;
+                    self.context.cte_to_relation.insert(
+                        table_name,
+                        Rc::new(RefCell::new(BindingCte {
+                            share_id,
+                            state: BindingCteState::Bound { query: bound_query },
+                            alias: alias.clone(),
+                        })),
+                    );
+                }
+                CteInner::ChangeLog(from_table_name) => {
+                    self.push_context();
+                    let from_table_relation =
+                        self.bind_relation_by_name(from_table_name, None, None, true)?;
+                    self.pop_context()?;
+                    self.context.cte_to_relation.insert(
+                        table_name,
+                        Rc::new(RefCell::new(BindingCte {
+                            share_id,
+                            state: BindingCteState::ChangeLog {
+                                table: from_table_relation,
+                            },
+                            alias: alias.clone(),
+                        })),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
