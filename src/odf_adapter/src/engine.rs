@@ -5,8 +5,9 @@ use ::serde::{Deserialize, Serialize};
 use datafusion::prelude::*;
 use indoc::indoc;
 use internal_error::*;
-use opendatafabric::engine::{ExecuteRawQueryError, ExecuteTransformError};
-use opendatafabric::*;
+use odf::metadata::engine::{ExecuteRawQueryError, ExecuteTransformError};
+use odf::metadata::*;
+use risingwave_common::array::arrow::Arrow57FromArrow;
 use serde_with::serde_as;
 
 use crate::rw::{RisingWave, RisingWaveConfig};
@@ -208,13 +209,19 @@ impl Engine {
                     skip_metadata: None,
                     schema: None,
                     file_sort_order: Vec::new(),
+                    file_decryption_properties: None,
+                    metadata_size_hint: None,
                 },
             )
             .await
             .int_err()?;
 
-        let arrow_schema = datafusion::arrow::datatypes::Schema::from(df.schema());
-        let rw_schema = risingwave_common::types::StructType::from(arrow_schema.fields());
+        let arrow_schema = df.schema().inner();
+
+        struct Convert;
+        impl Arrow57FromArrow for Convert {}
+
+        let rw_schema = Convert.from_fields(arrow_schema.fields()).int_err()?;
         let ddl_schema = rw_schema
             .iter()
             .filter(|(n, _)| {
@@ -311,6 +318,7 @@ impl Engine {
 
         tracing::info!(pg_query, "Create sink query");
         rw.pg.execute(&pg_query, &[]).await.map_db_err()?;
+        tracing::info!("Created sink");
 
         Ok(())
     }
@@ -383,21 +391,19 @@ impl Engine {
 #[serde_as]
 #[derive(Serialize, Debug)]
 struct SourceManifest<'a>(
-    #[serde_as(as = "opendatafabric::serde::yaml::TransformRequestInputDef")]
-    &'a TransformRequestInput,
+    #[serde_as(as = "odf::serde::yaml::TransformRequestInputDef")] &'a TransformRequestInput,
 );
 
 #[serde_as]
 #[derive(Serialize, Debug)]
 struct SinkManifest<'a>(
-    #[serde_as(as = "opendatafabric::serde::yaml::TransformRequestDef")] &'a TransformRequest,
+    #[serde_as(as = "odf::serde::yaml::TransformRequestDef")] &'a TransformRequest,
 );
 
 #[serde_as]
 #[derive(Deserialize, Debug)]
 struct SinkSummary(
-    #[serde_as(as = "opendatafabric::serde::yaml::TransformResponseSuccessDef")]
-    TransformResponseSuccess,
+    #[serde_as(as = "odf::serde::yaml::TransformResponseSuccessDef")] TransformResponseSuccess,
 );
 
 /////////////////////////////////////////////////////////////////////////////////////////

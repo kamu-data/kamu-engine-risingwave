@@ -2,8 +2,8 @@ use std::assert_matches::assert_matches;
 
 use chrono::{TimeZone, Utc};
 use indoc::indoc;
-use opendatafabric::engine::ExecuteTransformError;
-use opendatafabric::*;
+use odf::metadata::engine::ExecuteTransformError;
+use odf::metadata::*;
 
 use super::{data, engine};
 

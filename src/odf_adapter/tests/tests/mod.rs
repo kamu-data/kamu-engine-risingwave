@@ -15,25 +15,37 @@ macro_rules! vary_chunks_size_and_delay {
 
             #[test_log::test(tokio::test)]
             async fn big_chunks_no_delay() {
-                std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "10");
+                unsafe {
+                    std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "10");
+                }
                 $test_fn().await;
-                std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "");
+                unsafe {
+                    std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "");
+                }
             }
 
             #[test_log::test(tokio::test)]
             async fn small_chunks_no_delay() {
-                std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "1");
+                unsafe {
+                    std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "1");
+                }
                 $test_fn().await;
-                std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "");
+                unsafe {
+                    std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "");
+                }
             }
 
             #[test_log::test(tokio::test)]
             async fn small_chunks_with_delay() {
-                std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "1");
-                std::env::set_var("RW_ODF_SOURCE_SLEEP_CHUNK_MS", "200");
+                unsafe {
+                    std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "1");
+                    std::env::set_var("RW_ODF_SOURCE_SLEEP_CHUNK_MS", "200");
+                }
                 $test_fn().await;
-                std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "");
-                std::env::set_var("RW_ODF_SOURCE_SLEEP_CHUNK_MS", "");
+                unsafe {
+                    std::env::set_var("RW_ODF_SOURCE_MAX_RECORDS_PER_CHUNK", "");
+                    std::env::set_var("RW_ODF_SOURCE_SLEEP_CHUNK_MS", "");
+                }
             }
         }
     };

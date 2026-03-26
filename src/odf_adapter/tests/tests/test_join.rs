@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use indoc::indoc;
-use opendatafabric::*;
+use odf::metadata::*;
 
 use super::{data, df_utils, engine};
 

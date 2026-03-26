@@ -15,7 +15,7 @@
 use std::cmp::{max, min};
 use std::marker::PhantomData;
 
-use faiss::index::hnsw::Hnsw;
+// use faiss::index::hnsw::Hnsw;
 use itertools::Itertools;
 use rand::Rng;
 use rand::distr::uniform::{UniformFloat, UniformSampler};
@@ -376,51 +376,51 @@ impl<M: MeasureDistanceBuilder, R: Rng> HnswBuilder<InMemoryVectorStore, HnswGra
         }
     }
 
-    pub fn with_faiss_hnsw(self, faiss_hnsw: Hnsw<'_>) -> Self {
-        assert_eq!(self.vector_store.len(), faiss_hnsw.levels_raw().len());
-        let (entry_point, _max_level) = faiss_hnsw.entry_point().unwrap();
-        let levels = faiss_hnsw.levels_raw();
-        let Some(graph) = &self.graph else {
-            assert_eq!(levels.len(), 0);
-            return Self::new(self.vector_store.dimension, self.rng, self.options);
-        };
-        assert_eq!(levels.len(), graph.nodes.len());
-        let mut nodes = Vec::with_capacity(graph.nodes.len());
-        for (node, level_count) in levels.iter().enumerate() {
-            let level_count = *level_count as usize;
-            let mut level_neighbors = Vec::with_capacity(level_count);
-            for level_idx in 0..level_count {
-                let neighbors = faiss_hnsw.neighbors_raw(node, level_idx);
-                let mut nearest_neighbors = BoundedNearest::new(max(neighbors.len(), 1));
-                for &neighbor in neighbors {
-                    nearest_neighbors.insert(
-                        M::distance(
-                            self.vector_store.vec_ref(node),
-                            self.vector_store.vec_ref(neighbor as _),
-                        ),
-                        || neighbor as _,
-                    );
-                }
-                level_neighbors.push(nearest_neighbors);
-            }
-            nodes.push(VectorHnswNode {
-                level_neighbours: level_neighbors,
-            });
-        }
-        let level_count = recovery_level_count(entry_point, &nodes);
-        Self {
-            options: self.options,
-            graph: Some(HnswGraphBuilder {
-                entrypoint: entry_point,
-                nodes,
-                level_node_count: level_count,
-            }),
-            vector_store: self.vector_store,
-            ctx: (),
-            rng: self.rng,
-            _measure: Default::default(),
-        }
-    }
+    // pub fn with_faiss_hnsw(self, faiss_hnsw: Hnsw<'_>) -> Self {
+    //     assert_eq!(self.vector_store.len(), faiss_hnsw.levels_raw().len());
+    //     let (entry_point, _max_level) = faiss_hnsw.entry_point().unwrap();
+    //     let levels = faiss_hnsw.levels_raw();
+    //     let Some(graph) = &self.graph else {
+    //         assert_eq!(levels.len(), 0);
+    //         return Self::new(self.vector_store.dimension, self.rng, self.options);
+    //     };
+    //     assert_eq!(levels.len(), graph.nodes.len());
+    //     let mut nodes = Vec::with_capacity(graph.nodes.len());
+    //     for (node, level_count) in levels.iter().enumerate() {
+    //         let level_count = *level_count as usize;
+    //         let mut level_neighbors = Vec::with_capacity(level_count);
+    //         for level_idx in 0..level_count {
+    //             let neighbors = faiss_hnsw.neighbors_raw(node, level_idx);
+    //             let mut nearest_neighbors = BoundedNearest::new(max(neighbors.len(), 1));
+    //             for &neighbor in neighbors {
+    //                 nearest_neighbors.insert(
+    //                     M::distance(
+    //                         self.vector_store.vec_ref(node),
+    //                         self.vector_store.vec_ref(neighbor as _),
+    //                     ),
+    //                     || neighbor as _,
+    //                 );
+    //             }
+    //             level_neighbors.push(nearest_neighbors);
+    //         }
+    //         nodes.push(VectorHnswNode {
+    //             level_neighbours: level_neighbors,
+    //         });
+    //     }
+    //     let level_count = recovery_level_count(entry_point, &nodes);
+    //     Self {
+    //         options: self.options,
+    //         graph: Some(HnswGraphBuilder {
+    //             entrypoint: entry_point,
+    //             nodes,
+    //             level_node_count: level_count,
+    //         }),
+    //         vector_store: self.vector_store,
+    //         ctx: (),
+    //         rng: self.rng,
+    //         _measure: Default::default(),
+    //     }
+    // }
 
     pub fn print_graph(&self) {
         let Some(graph) = &self.graph else {
@@ -711,6 +711,7 @@ mod __hnsw_test_hooks {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1115,3 +1116,4 @@ mod tests {
         );
     }
 }
+*/

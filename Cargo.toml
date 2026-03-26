@@ -109,6 +109,7 @@ libraries = [{ path = "./lints" }]
 [workspace.dependencies]
 apache-avro = { git = "https://github.com/risingwavelabs/avro-rs", rev = "1f2723802d4fb77b97fa084f7bb81e3b60b9e03f" }
 arc-swap = "1"
+arrow = { version = "57" }
 arrow-udf-runtime = "0.8.0"
 async-openai = { version = "0.33.0", features = ["embedding"] }
 auto_enums = { version = "0.8", features = ["futures03", "tokio1"] }
@@ -158,7 +159,7 @@ criterion = { version = "0.8", features = ["async_futures"] }
 # Keep in sync with deltalake dependency
 datafusion = { version = "52", default-features = false }
 deltalake = { version = "0.31", features = ["s3", "gcs"] }
-faiss = { version = "0.12.2-alpha.0", features = ["static"] }
+# faiss = { version = "0.12.2-alpha.0", features = ["static"] }
 foyer = { version = "0.21.2", features = ["serde", "tracing"] }
 futures-async-stream = "0.2.13"
 governor = { version = "0.10", default-features = false, features = ["std"] }
@@ -194,6 +195,7 @@ mysql_async = { version = "0.36", features = [
     "rust_decimal",
 ] }
 opendal = "0.55"
+odf = { git = "https://github.com/kamu-data/kamu-cli", branch = "master", version = "0.261.0", default-features = false, package = "opendatafabric" }
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 opentelemetry-semantic-conventions = "0.31"
@@ -425,7 +427,7 @@ debug = "line-tables-only"
 opt-level = 2
 
 [patch.crates-io]
-faiss = { git = "https://github.com/risingwavelabs/faiss-rs.git", rev = "f6f0acb" }
+# faiss = { git = "https://github.com/risingwavelabs/faiss-rs.git", rev = "f6f0acb" }
 # Patch third-party crates for deterministic simulation.
 getrandom = { git = "https://github.com/madsim-rs/getrandom.git", rev = "e79a7ae" }
 # Don't patch `tokio-stream`, but only use the madsim version for **direct** dependencies.

@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use arrow_array::cast::AsArray;
+use arrow::array::RecordBatch;
+use arrow::array::cast::AsArray;
 use async_trait::async_trait;
 use datafusion::prelude::*;
 use futures_async_stream::try_stream;
-use opendatafabric as odf;
+use risingwave_common::array::arrow::{Arrow57FromArrow, IcebergArrowConvert};
 use risingwave_common::array::{ArrayImplBuilder, DataChunk, Op, StreamChunk};
 use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::types::{DataType, JsonbVal, ScalarRefImpl, Timestamptz};
@@ -17,12 +18,12 @@ use serde_with::serde_as;
 use with_options::WithOptions;
 
 use super::{
-    BoxChunkSourceStream, Column, SourceContextRef, SourceEnumeratorContextRef, SplitEnumerator,
-    SplitId, SplitMetaData, SplitReader,
+    Column, SourceContextRef, SourceEnumeratorContextRef, SplitEnumerator, SplitId, SplitMetaData,
+    SplitReader,
 };
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::ParserConfig;
-use crate::source::{SourceProperties, UnknownFields};
+use crate::source::{BoxSourceChunkStream, SourceProperties, UnknownFields};
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -47,7 +48,7 @@ pub struct OdfProperties {
 }
 
 impl OdfProperties {
-    pub fn read_input_manifest(&self) -> ConnectorResult<odf::TransformRequestInput> {
+    pub fn read_input_manifest(&self) -> ConnectorResult<odf::metadata::TransformRequestInput> {
         let f = std::fs::File::open(PathBuf::from(&self.input_manifest_path))?;
         let input: InputManifest = serde_json::from_reader(f)?;
         Ok(input.0)
@@ -68,10 +69,17 @@ impl SourceProperties for OdfProperties {
     const SOURCE_NAME: &'static str = ODF_CONNECTOR;
 }
 
+impl crate::enforce_secret::EnforceSecret for OdfProperties {
+    fn enforce_secret<'a>(_prop_iter: impl Iterator<Item = &'a str>) -> ConnectorResult<()> {
+        Ok(())
+    }
+}
+
 #[serde_as]
 #[derive(Deserialize, Debug)]
 struct InputManifest(
-    #[serde_as(as = "odf::serde::yaml::TransformRequestInputDef")] odf::TransformRequestInput,
+    #[serde_as(as = "odf::serde::yaml::TransformRequestInputDef")]
+    odf::metadata::TransformRequestInput,
 );
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -159,16 +167,16 @@ impl SplitMetaData for OdfSplit {
         serde_json::to_value(self.clone()).unwrap().into()
     }
 
-    fn update_with_offset(&mut self, start_offset: String) -> ConnectorResult<()> {
+    fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
         // Reader encodes a *remaining* interval into RW's `offset` field
-        let new_interval = start_offset;
+        let new_interval = last_seen_offset;
 
         tracing::debug!(
             split_id = %self.id,
             start_offset = self.start_offset,
             end_offset = self.end_offset,
             %new_interval,
-            "OdfSplit::update_with_offset()",
+            "OdfSplit::update_offset()",
         );
 
         let inner = new_interval
@@ -188,9 +196,11 @@ impl SplitMetaData for OdfSplit {
 ////////////////////////////////////////////////////////////////////////////////////////
 pub struct OdfSplitReader {
     split: OdfSplit,
-    input: odf::TransformRequestInput,
+    input: odf::metadata::TransformRequestInput,
     idle_marker_path: PathBuf,
+    #[allow(dead_code)]
     source_ctx: SourceContextRef,
+    #[allow(dead_code)]
     parser_config: ParserConfig,
     columns: Vec<Column>,
     // Used to emit explicit watermarks
@@ -219,8 +229,7 @@ impl OdfSplitReader {
         if let Some(input_iv) = self.input.offset_interval.as_ref() {
             if (input_iv.end + 1) != self.split.end_offset {
                 assert_eq!(
-                    self.split.start_offset,
-                    self.split.end_offset,
+                    self.split.start_offset, self.split.end_offset,
                     "Received new empty input interval while not all records been read on the previous step",
                 );
 
@@ -249,8 +258,7 @@ impl OdfSplitReader {
             }
         } else {
             assert_eq!(
-                self.split.start_offset,
-                self.split.end_offset,
+                self.split.start_offset, self.split.end_offset,
                 "Received new empty input interval while not all records been read on the previous step",
             );
             Ok((self.split.start_offset, self.split.end_offset))
@@ -322,9 +330,6 @@ impl SplitReader for OdfSplitReader {
                 .map(|c| Field {
                     data_type: c.data_type.clone(),
                     name: c.name.clone(),
-                    // TODO: Nested structs support
-                    sub_fields: Vec::new(),
-                    type_name: String::new(),
                 })
                 .collect(),
         );
@@ -341,7 +346,7 @@ impl SplitReader for OdfSplitReader {
         })
     }
 
-    fn into_stream(self) -> BoxChunkSourceStream {
+    fn into_stream(self) -> BoxSourceChunkStream {
         Box::pin(self.into_chunk_stream())
     }
 }
@@ -449,7 +454,7 @@ impl OdfSplitReader {
         path: &Path,
         start_offset: u64,
         end_offset: u64,
-    ) -> ConnectorResult<Vec<arrow_array::RecordBatch>> {
+    ) -> ConnectorResult<Vec<RecordBatch>> {
         let df = ctx
             .read_parquet(
                 path.as_os_str().to_str().unwrap(),
@@ -460,6 +465,8 @@ impl OdfSplitReader {
                     skip_metadata: None,
                     schema: None,
                     file_sort_order: Vec::new(),
+                    metadata_size_hint: None,
+                    file_decryption_properties: None,
                 },
             )
             .await
@@ -492,7 +499,11 @@ impl OdfSplitReader {
             .map_err(|e| anyhow!(e))?;
 
         let batches = df.collect().await.map_err(|e| anyhow!(e))?;
-        tracing::debug!(num_batches = batches.len(), "Collected the arrow batches");
+        tracing::info!(
+            num_batches = batches.len(),
+            num_records = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            "Collected the arrow batches",
+        );
 
         Ok(batches)
     }
@@ -500,13 +511,13 @@ impl OdfSplitReader {
     #[tracing::instrument(level = "info", skip_all)]
     fn record_batch_into_stream_chunk(
         &self,
-        mut batch: arrow_array::RecordBatch,
+        mut batch: RecordBatch,
         remaining_interval: &str,
     ) -> ConnectorResult<StreamChunk> {
         // First column is the operation type
         let ops_arrow = batch.remove_column(0);
         let ops: Vec<Op> = ops_arrow
-            .as_primitive::<arrow_array::types::Int32Type>()
+            .as_primitive::<arrow::datatypes::Int32Type>()
             .iter()
             .map(|op| match op {
                 Some(0) => Op::Insert,
@@ -518,7 +529,7 @@ impl OdfSplitReader {
             .collect();
 
         // Convert the rest
-        let data_chunk = DataChunk::try_from(&batch).map_err(|e| anyhow!(e))?;
+        let data_chunk = IcebergArrowConvert.from_record_batch(&batch)?;
 
         // Add special columns
         let data_chunk =

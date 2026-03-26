@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use indoc::indoc;
-use opendatafabric::*;
+use odf::metadata::*;
 
 use super::{data, df_utils, engine};
 
@@ -77,7 +77,7 @@ async fn test_top_n() {
                         alias: Some("leaderboard".to_string()),
                         query: indoc!(
                             r#"
-                            create materialized view leaderboard as
+                            create view leaderboard as
                             select
                                 *
                             from (
@@ -114,7 +114,7 @@ async fn test_top_n() {
         let expected_schema = indoc!(
             r#"
             message arrow_schema {
-              OPTIONAL INT64 offset;
+              REQUIRED INT64 offset;
               REQUIRED INT32 op;
               REQUIRED INT64 system_time (TIMESTAMP(MILLIS,true));
               OPTIONAL INT64 event_time (TIMESTAMP(MILLIS,true));

@@ -1113,9 +1113,9 @@ impl<S: StateStore> SourceExecutor<S> {
                         .extend(latest_state);
 
                     let card = chunk.cardinality();
-                    if card == 0 {
-                        continue;
-                    }
+                    // if card == 0 {
+                    //     continue;
+                    // }
                     source_output_row_count.inc_by(card as u64);
                     let to_remove_col_indices =
                         if let Some(pulsar_message_id_idx) = pulsar_message_id_idx {
@@ -1123,7 +1123,7 @@ impl<S: StateStore> SourceExecutor<S> {
                         } else {
                             vec![split_idx, offset_idx]
                         };
-                    let chunk =
+                    let mut chunk =
                         prune_additional_cols(&chunk, &to_remove_col_indices, &source_desc.columns);
 
                     // HACK: KAMU: Explicit source watermark propagation

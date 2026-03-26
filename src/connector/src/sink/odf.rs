@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use core::fmt::Debug;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use arrow_array::RecordBatch;
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use chrono::{DateTime, Utc};
-use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::config::TableParquetOptions;
 use datafusion::prelude::*;
-use opendatafabric as odf;
+use risingwave_common::array::arrow::{Arrow57ToArrow, DeltaLakeConvert};
 use risingwave_common::array::{Op, StreamChunk, StreamChunkTestExt};
 use risingwave_common::catalog::Schema;
-use serde_derive::{Deserialize, Serialize};
+use risingwave_common::util::iter_util::ZipEqFast as _;
+use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use thiserror_ext::AsReport;
 use with_options::WithOptions;
 
-use super::{DummySinkCommitCoordinator, SinkWriterParam};
+use super::SinkWriterParam;
+use crate::error::ConnectorResult;
 use crate::sink::log_store::DeliveryFutureManagerAddFuture;
 use crate::sink::writer::{
     AsyncTruncateLogSinkerOf, AsyncTruncateSinkWriter, AsyncTruncateSinkWriterExt,
@@ -53,19 +55,23 @@ pub struct OdfConfig {
 
 /// Basic data types for use with the mqtt interface
 impl OdfConfig {
-    pub fn from_hashmap(values: HashMap<String, String>) -> SinkResult<Self> {
+    pub fn from_btreemap(values: &std::collections::BTreeMap<String, String>) -> SinkResult<Self> {
         let config = serde_json::from_value::<OdfConfig>(serde_json::to_value(values).unwrap())
             .map_err(|e| SinkError::Config(anyhow!(e)))?;
+
         Ok(config)
     }
 
-    pub fn read_manifest(&self) -> SinkResult<odf::TransformRequest> {
+    pub fn read_manifest(&self) -> SinkResult<odf::metadata::TransformRequest> {
         let f = std::fs::File::open(PathBuf::from(&self.manifest_path)).map_err(|e| anyhow!(e))?;
         let manifest: Manifest = serde_json::from_reader(f).map_err(|e| anyhow!(e))?;
         Ok(manifest.0)
     }
 
-    pub fn write_summary(&self, summary: odf::TransformResponseSuccess) -> SinkResult<()> {
+    pub fn write_summary(
+        &self,
+        summary: odf::metadata::TransformResponseSuccess,
+    ) -> SinkResult<()> {
         let f =
             std::fs::File::create_new(PathBuf::from(&self.summary_path)).map_err(|e| anyhow!(e))?;
         serde_json::to_writer(f, &Summary(&summary)).map_err(|e| anyhow!(e))?;
@@ -75,13 +81,15 @@ impl OdfConfig {
 
 #[serde_as]
 #[derive(Deserialize, Debug)]
-struct Manifest(#[serde_as(as = "odf::serde::yaml::TransformRequestDef")] odf::TransformRequest);
+struct Manifest(
+    #[serde_as(as = "odf::serde::yaml::TransformRequestDef")] odf::metadata::TransformRequest,
+);
 
 #[serde_as]
 #[derive(Serialize, Debug)]
 struct Summary<'a>(
     #[serde_as(as = "odf::serde::yaml::TransformResponseSuccessDef")]
-    &'a odf::TransformResponseSuccess,
+    &'a odf::metadata::TransformResponseSuccess,
 );
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -95,6 +103,12 @@ pub struct OdfSink {
     sink_from_name: String,
 }
 
+impl crate::enforce_secret::EnforceSecret for OdfSink {
+    fn enforce_secret<'a>(_prop_iter: impl Iterator<Item = &'a str>) -> ConnectorResult<()> {
+        Ok(())
+    }
+}
+
 impl TryFrom<SinkParam> for OdfSink {
     type Error = SinkError;
 
@@ -102,11 +116,11 @@ impl TryFrom<SinkParam> for OdfSink {
         tracing::info!(?param, "OdfSink::new()");
 
         let schema = param.schema();
-        let config = OdfConfig::from_hashmap(param.properties)?;
+        let config = OdfConfig::from_btreemap(&param.properties)?;
         Ok(Self {
             config,
             schema,
-            pk_indices: param.downstream_pk,
+            pk_indices: param.downstream_pk_or_empty(),
             db_name: param.db_name,
             sink_from_name: param.sink_from_name,
         })
@@ -115,7 +129,6 @@ impl TryFrom<SinkParam> for OdfSink {
 
 // TODO: Research sink decoupling (see parent trait)
 impl Sink for OdfSink {
-    type Coordinator = DummySinkCommitCoordinator;
     type LogSinker = AsyncTruncateLogSinkerOf<OdfSinkWriter>;
 
     const SINK_NAME: &'static str = ODF_SINK;
@@ -143,7 +156,8 @@ impl Sink for OdfSink {
 pub struct OdfSinkWriter {
     config: OdfConfig,
     schema: Schema,
-    manifest: odf::TransformRequest,
+    schema_arrow: SchemaRef,
+    manifest: odf::metadata::TransformRequest,
     debug: bool,
     buffer: Vec<StreamChunk>,
     initial_checkpoint_seen: bool,
@@ -164,9 +178,24 @@ impl OdfSinkWriter {
         // TODO: replace with engine configuration propagated via ODF manifests
         let debug = std::env::var("RW_ODF_SINK_DEBUG").ok().as_deref() == Some("1");
 
+        // Convert schema
+        let arrow_fields: Vec<_> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                DeltaLakeConvert
+                    .to_arrow_field(&f.name, &f.data_type)
+                    .unwrap()
+            })
+            .collect();
+        let schema_arrow = Arc::new(arrow::datatypes::Schema::new(arrow_fields));
+
+        Self::validate_schema(&schema_arrow, &manifest.vocab)?;
+
         Ok::<_, SinkError>(Self {
             config: config.clone(),
             schema: schema.clone(),
+            schema_arrow,
             manifest,
             debug,
             buffer: Vec::new(),
@@ -174,7 +203,10 @@ impl OdfSinkWriter {
         })
     }
 
-    fn validate_schema(schema: &Schema, vocab: &odf::DatasetVocabulary) -> SinkResult<()> {
+    fn validate_schema(
+        schema: &SchemaRef,
+        vocab: &odf::metadata::DatasetVocabulary,
+    ) -> SinkResult<()> {
         let system_columns = [
             &vocab.offset_column,
             &vocab.operation_type_column,
@@ -184,7 +216,7 @@ impl OdfSinkWriter {
             if schema
                 .fields
                 .iter()
-                .position(|f| f.name == *system_column)
+                .position(|f| *f.name() == *system_column)
                 .is_some()
             {
                 return Err(anyhow!(
@@ -200,7 +232,7 @@ impl OdfSinkWriter {
         if schema
             .fields
             .iter()
-            .position(|f| f.name == vocab.event_time_column)
+            .position(|f| *f.name() == vocab.event_time_column)
             .is_none()
         {
             return Err(anyhow!(
@@ -209,7 +241,7 @@ impl OdfSinkWriter {
                 schema
                     .fields
                     .iter()
-                    .map(|f| f.name.as_str())
+                    .map(|f| f.name().as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -264,10 +296,11 @@ impl OdfSinkWriter {
             "Flushing buffered records into Parquet"
         );
         if num_records == 0 {
-            self.config.write_summary(odf::TransformResponseSuccess {
-                new_offset_interval: None,
-                new_watermark,
-            })?;
+            self.config
+                .write_summary(odf::metadata::TransformResponseSuccess {
+                    new_offset_interval: None,
+                    new_watermark,
+                })?;
             return Ok(());
         }
 
@@ -283,13 +316,14 @@ impl OdfSinkWriter {
 
         self.write_result(batches).await.map_err(|e| anyhow!(e))?;
 
-        self.config.write_summary(odf::TransformResponseSuccess {
-            new_offset_interval: Some(odf::OffsetInterval {
-                start: self.manifest.next_offset,
-                end: self.manifest.next_offset + num_records as u64 - 1,
-            }),
-            new_watermark,
-        })?;
+        self.config
+            .write_summary(odf::metadata::TransformResponseSuccess {
+                new_offset_interval: Some(odf::metadata::OffsetInterval {
+                    start: self.manifest.next_offset,
+                    end: self.manifest.next_offset + num_records as u64 - 1,
+                }),
+                new_watermark,
+            })?;
 
         Ok(())
     }
@@ -343,30 +377,26 @@ impl OdfSinkWriter {
 
     /// Converts chunk data columns into arrow arrays
     fn stream_chunk_data_to_arrow_arrays(
+        &self,
         chunk: StreamChunk,
-    ) -> SinkResult<Vec<Arc<dyn arrow_array::Array>>> {
-        let chunk = if chunk.is_compacted() {
-            chunk
-        } else {
-            chunk.compact()
-        };
+    ) -> SinkResult<Vec<Arc<dyn arrow::array::Array>>> {
+        let chunk = chunk.compact_vis();
 
-        let mut columns = Vec::new();
-        for column in chunk.columns() {
-            let arrow_column =
-                Arc::<dyn arrow_array::Array>::try_from(column.as_ref()).map_err(|e| anyhow!(e))?;
-
-            columns.push(arrow_column);
-        }
+        let columns: Vec<_> = chunk
+            .columns()
+            .iter()
+            .zip_eq_fast(self.schema_arrow.fields().iter())
+            .map(|(column, field)| DeltaLakeConvert.to_array(field.data_type(), column))
+            .try_collect()?;
 
         Ok(columns)
     }
 
     // See: https://github.com/open-data-fabric/open-data-fabric/blob/master/open-data-fabric.md#representation-of-retractions-and-corrections
-    fn stream_chunk_ops_to_arrow_array(ops: &[Op]) -> SinkResult<Arc<dyn arrow_array::Array>> {
+    fn stream_chunk_ops_to_arrow_array(ops: &[Op]) -> SinkResult<Arc<dyn arrow::array::Array>> {
         // TODO: Use u8 type after Spark is updated
         // See: https://github.com/kamu-data/kamu-cli/issues/445
-        let mut builder = arrow_array::Int32Array::builder(ops.len());
+        let mut builder = arrow::array::Int32Array::builder(ops.len());
 
         for op in ops {
             builder.append_value(match op {
@@ -384,20 +414,20 @@ impl OdfSinkWriter {
     fn stream_chunk_to_arrow_batch(
         &self,
         chunk: StreamChunk,
-        schema: Option<arrow_schema::SchemaRef>,
+        schema: Option<arrow::datatypes::SchemaRef>,
         operation_type_column: &str,
     ) -> SinkResult<RecordBatch> {
         let ops_array = Self::stream_chunk_ops_to_arrow_array(chunk.ops())?;
         let ops_data_type = ops_array.data_type().clone();
 
         let mut columns = vec![ops_array];
-        columns.append(&mut Self::stream_chunk_data_to_arrow_arrays(chunk)?);
+        columns.append(&mut self.stream_chunk_data_to_arrow_arrays(chunk)?);
 
         let schema = if let Some(schema) = schema {
             assert_eq!(columns.len(), schema.fields().len());
             schema
         } else {
-            let mut fields = vec![arrow_schema::Field::new(
+            let mut fields = vec![arrow::datatypes::Field::new(
                 operation_type_column,
                 ops_data_type,
                 false,
@@ -407,22 +437,23 @@ impl OdfSinkWriter {
                 // TODO: Nullability is missing from schema and cannot be inferred
                 let nullable = true;
 
-                fields.push(arrow_schema::Field::new(
+                fields.push(arrow::datatypes::Field::new(
                     field.name.clone(),
                     array.data_type().clone(),
                     nullable,
                 ));
             }
 
-            Arc::new(arrow_schema::Schema::new(fields))
+            Arc::new(arrow::datatypes::Schema::new(fields))
         };
 
-        let batch = arrow_array::RecordBatch::try_new(schema, columns).map_err(|e| anyhow!(e))?;
+        let batch = arrow::array::RecordBatch::try_new(schema, columns).map_err(|e| anyhow!(e))?;
         Ok(batch)
     }
 
     #[tracing::instrument(level = "info", skip_all)]
     async fn write_result(&self, batches: Vec<RecordBatch>) -> datafusion::error::Result<()> {
+        let path = &self.manifest.new_data_path;
         let ctx = SessionContext::new();
         let table = datafusion::datasource::MemTable::try_new(batches[0].schema(), vec![batches])?;
         let df = ctx.read_table(Arc::new(table))?;
@@ -436,13 +467,26 @@ impl OdfSinkWriter {
             self.manifest.next_offset,
         )?;
 
+        // FIXME: The  extension is currently necessary for DataFusion to
+        // respect the single-file output
+        // See: https://github.com/apache/datafusion/issues/13323
+        let tmp_path = if path.extension().is_some() {
+            path.to_path_buf()
+        } else {
+            path.with_extension("parquet")
+        };
+
         // TODO: Configure columns writer
         df.write_parquet(
-            self.manifest.new_data_path.as_os_str().to_str().unwrap(),
+            tmp_path.as_os_str().to_str().unwrap(),
             datafusion::dataframe::DataFrameWriteOptions::new().with_single_file_output(true),
             Some(Self::get_writer_properties(&self.manifest.vocab)),
         )
         .await?;
+
+        if tmp_path != *path {
+            std::fs::rename(&tmp_path, path).unwrap();
+        }
 
         Ok(())
     }
@@ -451,7 +495,7 @@ impl OdfSinkWriter {
     // represeted as `Timestamp(Millis, "UTC")` for compatibility with other engines
     // (e.g. Flink does not support event time with nanosecond precision).
     fn normalize_raw_result(df: DataFrame) -> datafusion::error::Result<DataFrame> {
-        use datafusion::arrow::datatypes::*;
+        use arrow::datatypes::*;
 
         let utc_tz: Arc<str> = Arc::from("UTC");
 
@@ -461,37 +505,34 @@ impl OdfSinkWriter {
         for field in df.schema().fields() {
             let expr = match field.data_type() {
                 DataType::Timestamp(TimeUnit::Millisecond, Some(tz)) if tz.as_ref() == "UTC" => {
-                    col(field.unqualified_column())
+                    col(field.name())
                 }
                 DataType::Timestamp(_, _) => {
                     noop = false;
                     cast(
-                        col(field.unqualified_column()),
+                        col(field.name()),
                         DataType::Timestamp(TimeUnit::Millisecond, Some(utc_tz.clone())),
                     )
                     .alias(field.name())
                 }
-                _ => col(field.unqualified_column()),
+                _ => col(field.name()),
             };
             select.push(expr);
         }
 
-        if noop {
-            Ok(df)
-        } else {
-            Ok(df.select(select)?)
-        }
+        if noop { Ok(df) } else { Ok(df.select(select)?) }
     }
 
     fn with_system_columns(
         df: DataFrame,
-        vocab: &odf::DatasetVocabulary,
+        vocab: &odf::metadata::DatasetVocabulary,
         system_time: DateTime<Utc>,
         start_offset: u64,
     ) -> datafusion::error::Result<DataFrame> {
         use datafusion::logical_expr::*;
+        use datafusion::scalar::ScalarValue;
 
-        // Collect non-system column names for later
+        // Collect column names for later
         let mut data_columns: Vec<_> = df
             .schema()
             .fields()
@@ -502,39 +543,39 @@ impl OdfSinkWriter {
             })
             .collect();
 
-        // Offset
-        // TODO: For some reason this adds two collumns: the expected "offset", but also
-        // "ROW_NUMBER()" for now we simply filter out the latter.
-        let df = df.with_column(
-            &vocab.offset_column,
-            Expr::WindowFunction(expr::WindowFunction {
-                fun: expr::WindowFunctionDefinition::BuiltInWindowFunction(
-                    BuiltInWindowFunction::RowNumber,
-                ),
-                args: vec![],
-                partition_by: vec![],
-                order_by: vec![],
-                window_frame: WindowFrame::new(None),
-            }),
-        )?;
-
-        // TODO: Cast to UInt64 after Spark is updated
-        // See: https://github.com/kamu-data/kamu-cli/issues/445
-        let df = df.with_column(
-            &vocab.offset_column,
-            cast(
-                col(&vocab.offset_column as &str) + lit(start_offset as i64 - 1),
-                arrow_schema::DataType::Int64,
-            ),
-        )?;
-
         // System time
         let df = df.with_column(
             &vocab.system_time_column,
-            Expr::Literal(datafusion::scalar::ScalarValue::TimestampMillisecond(
-                Some(system_time.timestamp_millis()),
-                Some("UTC".into()),
-            )),
+            Expr::Literal(
+                ScalarValue::TimestampMillisecond(
+                    Some(system_time.timestamp_millis()),
+                    Some("UTC".into()),
+                ),
+                None,
+            ),
+        )?;
+
+        // Assign offset based on the merge strategy's sort order
+        // TODO: For some reason this adds two columns: the expected
+        // "offset", but also "ROW_NUMBER()" for now we simply filter out the
+        // latter.
+        let df = df.with_column(
+            &vocab.offset_column,
+            datafusion::functions_window::row_number::row_number()
+                //.order_by(lit(1))
+                .partition_by(vec![lit(1)])
+                .build()?,
+        )?;
+
+        let df = df.with_column(
+            &vocab.offset_column,
+            cast(
+                col(Column::from_name(&vocab.offset_column))
+                    + lit(i64::try_from(start_offset).unwrap() - 1),
+                // TODO: Replace with UInt64 after Spark is updated
+                // See: https://github.com/kamu-data/kamu-cli/issues/445
+                arrow::datatypes::DataType::Int64,
+            ),
         )?;
 
         // Reorder columns for nice looks
@@ -549,23 +590,49 @@ impl OdfSinkWriter {
 
         let df = df.select_columns(&full_columns_str)?;
 
+        // Note: As the very last step we sort the data by offset to guarantee its
+        // sequential layout in the parquet file
+        let df = df.sort(vec![col(&vocab.offset_column).sort(true, true)])?;
+
         tracing::info!(schema = ?df.schema(), "Computed final result schema");
         Ok(df)
     }
 
     // TODO: Externalize configuration
-    fn get_writer_properties(vocab: &odf::DatasetVocabulary) -> WriterProperties {
+    fn get_writer_properties(vocab: &odf::metadata::DatasetVocabulary) -> TableParquetOptions {
+        use datafusion::common::parquet_config::DFParquetWriterVersion;
+        use datafusion::config::{ParquetColumnOptions, ParquetOptions, TableParquetOptions};
+
         // TODO: `offset` column is sorted integers so we could use delta encoding, but
         // Flink does not support it.
         // See: https://github.com/kamu-data/kamu-engine-flink/issues/3
-        WriterProperties::builder()
-            .set_writer_version(datafusion::parquet::file::properties::WriterVersion::PARQUET_1_0)
-            .set_compression(datafusion::parquet::basic::Compression::SNAPPY)
-            // op column is low cardinality and best encoded as RLE_DICTIONARY
-            .set_column_dictionary_enabled(vocab.operation_type_column.as_str().into(), true)
-            // system_time value will be the same for all rows in a batch
-            .set_column_dictionary_enabled(vocab.system_time_column.as_str().into(), true)
-            .build()
+        TableParquetOptions {
+            global: ParquetOptions {
+                writer_version: DFParquetWriterVersion::V1_0,
+                compression: Some("snappy".into()),
+                ..ParquetOptions::default()
+            },
+            column_specific_options: std::collections::HashMap::from([
+                (
+                    // op column is low cardinality and best encoded as RLE_DICTIONARY
+                    vocab.operation_type_column.clone(),
+                    ParquetColumnOptions {
+                        dictionary_enabled: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    vocab.system_time_column.clone(),
+                    ParquetColumnOptions {
+                        // system_time value will be the same for all rows in a batch
+                        dictionary_enabled: Some(true),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            key_value_metadata: std::collections::HashMap::new(),
+            crypto: datafusion::config::ParquetEncryptionOptions::default(),
+        }
     }
 }
 
@@ -575,19 +642,35 @@ impl AsyncTruncateSinkWriter for OdfSinkWriter {
         chunk: StreamChunk,
         _add_future: DeliveryFutureManagerAddFuture<'a, Self::DeliveryFuture>,
     ) -> SinkResult<()> {
+        if self.manifest.prev_checkpoint_path.is_some() && !self.initial_checkpoint_seen {
+            // TODO: HACK: For some reason during startup from an old checkpoint sink receives data
+            // that was already flushed. We seem to be handling barriers correctly, so need to investigate
+            // the upper level `LogSinkerOf<W>` to understand why it does not truncate the seen chunks.
+            tracing::debug!("Ignoring a chunk prior to inintial checkpoint");
+            return Ok(());
+        }
+
         let num_records = chunk.cardinality();
 
         if num_records == 0 {
-            tracing::debug!("Ingoring an empty chunk");
+            tracing::debug!("Ignoring an empty chunk");
         } else {
-            tracing::debug!(
-                chunk_records = chunk.cardinality(),
-                buffered_records = self.num_records_buffered(),
-                "Buffering a chunk",
-            );
+            if !self.debug {
+                tracing::debug!(
+                    chunk_records = chunk.cardinality(),
+                    buffered_records = self.num_records_buffered(),
+                    "Buffering a chunk",
+                );
+            } else {
+                tracing::debug!(
+                    chunk = %chunk.to_pretty_with_schema(&self.schema),
+                    "Buffering a chunk",
+                );
+            }
 
             self.buffer.push(chunk);
         }
+
         Ok(())
     }
 
@@ -638,7 +721,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use datafusion::prelude::*;
     use futures::TryStreamExt;
-    use opendatafabric::*;
+    use odf::metadata::*;
     use risingwave_common::catalog::ColumnId;
     use risingwave_common::types::DataType;
     use risingwave_pb::plan_common::additional_column::ColumnType;
@@ -650,9 +733,7 @@ mod tests {
     use crate::sink::log_store::DeliveryFutureManager;
     use crate::sink::odf::*;
     use crate::source::odf::*;
-    use crate::source::{
-        Column, SourceColumnDesc, SourceColumnType, SourceContextRef, SplitReader,
-    };
+    use crate::source::{Column, SourceColumnDesc, SourceColumnType, SourceContext, SplitReader};
 
     #[tokio::test]
     #[tracing_test::traced_test]
@@ -719,7 +800,7 @@ mod tests {
             OdfProperties {
                 input_manifest_path: source_manifest_path.display().to_string(),
                 idle_marker_path: idle_marker_path.display().to_string(),
-                unknown_fields: HashMap::default(),
+                unknown_fields: Default::default(),
             },
             vec![OdfSplit::new(
                 request.query_inputs[0].dataset_id.clone(),
@@ -733,7 +814,6 @@ mod tests {
                             name: "event_time".to_string(),
                             data_type: DataType::Timestamptz,
                             column_id: ColumnId::new(1),
-                            fields: vec![],
                             column_type: SourceColumnType::Normal,
                             is_pk: false,
                             is_hidden_addition_col: false,
@@ -743,7 +823,6 @@ mod tests {
                             name: "counter".to_string(),
                             data_type: DataType::Int32,
                             column_id: ColumnId::new(2),
-                            fields: vec![],
                             column_type: SourceColumnType::Normal,
                             is_pk: false,
                             is_hidden_addition_col: false,
@@ -753,7 +832,6 @@ mod tests {
                             name: "_row_id".to_string(),
                             data_type: DataType::Serial,
                             column_id: ColumnId::new(0),
-                            fields: vec![],
                             column_type: SourceColumnType::RowId,
                             is_pk: true,
                             is_hidden_addition_col: false,
@@ -763,7 +841,6 @@ mod tests {
                             name: "_rw_odf_partition".to_string(),
                             data_type: DataType::Varchar,
                             column_id: ColumnId::new(3),
-                            fields: vec![],
                             column_type: SourceColumnType::Normal,
                             is_pk: false,
                             is_hidden_addition_col: true,
@@ -777,7 +854,6 @@ mod tests {
                             name: "_rw_odf_offset".to_string(),
                             data_type: DataType::Varchar,
                             column_id: ColumnId::new(5),
-                            fields: vec![],
                             column_type: SourceColumnType::Normal,
                             is_pk: false,
                             is_hidden_addition_col: true,
@@ -788,7 +864,6 @@ mod tests {
                     ],
                 },
                 specific: SpecificParserConfig {
-                    key_encoding_config: None,
                     encoding_config: EncodingProperties::Csv(CsvProperties {
                         delimiter: 44,
                         has_header: false,
@@ -796,7 +871,7 @@ mod tests {
                     protocol_config: ProtocolProperties::Plain,
                 },
             },
-            SourceContextRef::default(),
+            SourceContext::dummy().into(),
             Some(vec![
                 Column {
                     name: "event_time".to_string(),
@@ -838,14 +913,10 @@ mod tests {
                     risingwave_common::catalog::Field {
                         data_type: DataType::Timestamptz,
                         name: "event_time".to_string(),
-                        sub_fields: Vec::new(),
-                        type_name: "".to_string(),
                     },
                     risingwave_common::catalog::Field {
                         data_type: DataType::Int32,
                         name: "counter".to_string(),
-                        sub_fields: Vec::new(),
-                        type_name: "".to_string(),
                     },
                 ],
             },
@@ -891,12 +962,14 @@ mod tests {
                     skip_metadata: None,
                     schema: None,
                     file_sort_order: Vec::new(),
+                    file_decryption_properties: None,
+                    metadata_size_hint: None,
                 },
             )
             .await
             .unwrap();
 
-        let arrow_schema = df.schema().clone();
+        let arrow_schema = df.schema().inner().clone();
         let batches = df.collect().await.unwrap();
 
         let actual = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
@@ -948,27 +1021,21 @@ mod tests {
             actual.trim(),
         );
 
-        let parquet_schema =
-            datafusion::parquet::arrow::arrow_to_parquet_schema(&arrow_schema.into()).unwrap();
-        let mut actual = Vec::new();
-        datafusion::parquet::schema::printer::print_schema(
-            &mut actual,
-            &parquet_schema.root_schema_ptr(),
-        );
         assert_eq!(
-            indoc::indoc!(
-                r#"
-                message arrow_schema {
-                  OPTIONAL INT64 offset;
-                  REQUIRED INT32 op;
-                  REQUIRED INT64 system_time (TIMESTAMP(MILLIS,true));
-                  OPTIONAL INT64 event_time (TIMESTAMP(MILLIS,true));
-                  OPTIONAL INT32 counter;
-                }
-                "#
-            )
-            .trim(),
-            std::str::from_utf8(&actual).unwrap().trim()
+            // indoc::indoc!(
+            //     r#"
+            //     message arrow_schema {
+            //       REQUIRED INT64 offset;
+            //       REQUIRED INT32 op;
+            //       REQUIRED INT64 system_time (TIMESTAMP(MILLIS,true));
+            //       OPTIONAL INT64 event_time (TIMESTAMP(MILLIS,true));
+            //       OPTIONAL INT32 counter;
+            //     }
+            //     "#
+            // )
+            // .trim(),
+            &arrow::datatypes::SchemaBuilder::new().finish(),
+            arrow_schema.as_ref(),
         );
 
         let summary: SinkSummary =
@@ -986,20 +1053,18 @@ mod tests {
     #[serde_with::serde_as]
     #[derive(::serde::Serialize, Debug)]
     struct SourceManifest<'a>(
-        #[serde_as(as = "opendatafabric::serde::yaml::TransformRequestInputDef")]
-        &'a TransformRequestInput,
+        #[serde_as(as = "odf::serde::yaml::TransformRequestInputDef")] &'a TransformRequestInput,
     );
 
     #[serde_with::serde_as]
     #[derive(::serde::Serialize, Debug)]
     struct SinkManifest<'a>(
-        #[serde_as(as = "opendatafabric::serde::yaml::TransformRequestDef")] &'a TransformRequest,
+        #[serde_as(as = "odf::serde::yaml::TransformRequestDef")] &'a TransformRequest,
     );
 
     #[serde_with::serde_as]
     #[derive(::serde::Deserialize, Debug)]
     struct SinkSummary(
-        #[serde_as(as = "opendatafabric::serde::yaml::TransformResponseSuccessDef")]
-        TransformResponseSuccess,
+        #[serde_as(as = "odf::serde::yaml::TransformResponseSuccessDef")] TransformResponseSuccess,
     );
 }

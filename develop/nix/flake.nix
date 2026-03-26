@@ -39,17 +39,17 @@
 
     devshell.url = "github:numtide/devshell";
 
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # rust-overlay = {
+    #   url = "github:oxalica/rust-overlay";
+    #   inputs.nixpkgs.follows = "nixpkgs";
+    # };
   };
 
   outputs = inputs@{ flake-parts, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [
         inputs.devshell.flakeModule
-        ./overlays.nix
+        # ./overlays.nix
         ./devshell.nix
       ];
 
@@ -59,6 +59,15 @@
         "aarch64-darwin"
         "x86_64-darwin"
       ];
+
+      perSystem = { system, ... }: {
+        _module.args.pkgs = import inputs.nixpkgs {
+          inherit system;
+          config = {
+            allowUnfree = true;
+          };
+        };
+      };
     };
 }
 

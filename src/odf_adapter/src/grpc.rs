@@ -3,18 +3,18 @@ use std::error::Error;
 use std::sync::Arc;
 
 use internal_error::InternalError;
-use opendatafabric::engine::grpc_generated::engine_server::Engine as EngineGRPC;
-use opendatafabric::engine::grpc_generated::{
+use odf::metadata::engine::grpc_generated::engine_server::Engine as EngineGRPC;
+use odf::metadata::engine::grpc_generated::{
     RawQueryRequest as RawQueryRequestGRPC, RawQueryResponse as RawQueryResponseGRPC,
     TransformRequest as TransformRequestGRPC, TransformResponse as TransformResponseGRPC,
 };
-use opendatafabric::engine::{ExecuteRawQueryError, ExecuteTransformError};
-use opendatafabric::serde::flatbuffers::FlatbuffersEngineProtocol;
-use opendatafabric::serde::{EngineProtocolDeserializer, EngineProtocolSerializer};
-use opendatafabric::{
+use odf::metadata::engine::{ExecuteRawQueryError, ExecuteTransformError};
+use odf::metadata::{
     RawQueryResponse, RawQueryResponseInternalError, TransformResponse,
     TransformResponseInternalError,
 };
+use odf::serde::flatbuffers::FlatbuffersEngineProtocol;
+use odf::serde::{EngineProtocolDeserializer, EngineProtocolSerializer};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;

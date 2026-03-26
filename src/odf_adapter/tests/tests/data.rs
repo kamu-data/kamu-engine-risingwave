@@ -112,7 +112,19 @@ fn create_dataset_common(
     drop(stdin);
     child.wait().unwrap().exit_ok().unwrap();
 
-    let data_dir = workspace.join(format!(".kamu/datasets/{name}/data"));
+    let output = Command::new("kamu")
+        .current_dir(workspace)
+        .arg("list")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--wide")
+        .output()
+        .unwrap();
+
+    let entries: Vec<DatasetEntry> = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = entries.into_iter().filter(|e| e.name == name).next().unwrap();
+
+    let data_dir = workspace.join(format!(".kamu/datasets/{}/data", entry.id.as_multibase()));
     let mut data_slices = Vec::new();
 
     for (chunk, event_time) in chunks {
@@ -144,4 +156,12 @@ fn create_dataset_common(
     let data_slices = data_slices.into_iter().map(|p| data_dir.join(p)).collect();
 
     Dataset { data_slices }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DatasetEntry {
+    #[serde(rename = "Name")]
+    name: odf::metadata::DatasetName,
+    #[serde(rename = "ID")]
+    id: odf::metadata::DatasetID,
 }

@@ -66,7 +66,8 @@ fn l2_norm_trivial(vec: &VectorInner<impl AsRef<[VectorItemType]>>) -> f32 {
 }
 
 fn l2_norm_faiss(vec: &VectorInner<impl AsRef<[VectorItemType]>>) -> f32 {
-    faiss::utils::fvec_norm_l2sqr(F32::inner_slice(vec.inner.as_ref())).sqrt()
+    todo!()
+    //faiss::utils::fvec_norm_l2sqr(F32::inner_slice(vec.inner.as_ref())).sqrt()
 }
 
 impl<T: AsRef<[VectorItemType]>> VectorInner<T> {

@@ -20,8 +20,9 @@ pub async fn assert_df_eq(df: DataFrame, expected_schema: &str, expected_data: &
         expected_data, actual,
     );
 
-    let parquet_schema =
-        datafusion::parquet::arrow::arrow_to_parquet_schema(&arrow_schema.into()).unwrap();
+    let parquet_schema = datafusion::parquet::arrow::ArrowSchemaConverter::new()
+        .convert(arrow_schema.inner())
+        .unwrap();
     let mut parquet_schema_buf = Vec::new();
     datafusion::parquet::schema::printer::print_schema(
         &mut parquet_schema_buf,
@@ -49,6 +50,8 @@ pub async fn assert_parquet_eq(path: &Path, expected_schema: &str, expected_data
                 skip_metadata: None,
                 schema: None,
                 file_sort_order: Vec::new(),
+                file_decryption_properties: None,
+                metadata_size_hint: None,
             },
         )
         .await

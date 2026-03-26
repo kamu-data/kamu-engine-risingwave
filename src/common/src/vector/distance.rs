@@ -114,7 +114,8 @@ fn l1_trivial(first: VectorRef<'_>, second: VectorRef<'_>) -> VectorDistance {
 }
 
 pub fn l1_faiss(first: VectorRef<'_>, second: VectorRef<'_>) -> VectorDistance {
-    faiss::utils::fvec_l1(first.as_raw_slice(), second.as_raw_slice()) as VectorDistance
+    todo!()
+    // faiss::utils::fvec_l1(first.as_raw_slice(), second.as_raw_slice()) as VectorDistance
 }
 
 impl<'a> MeasureDistance for L1DistanceMeasure<'a> {
@@ -151,7 +152,8 @@ fn l2sqr_trivial(first: VectorRef<'_>, second: VectorRef<'_>) -> VectorDistance 
 }
 
 pub fn l2sqr_faiss(first: VectorRef<'_>, second: VectorRef<'_>) -> VectorDistance {
-    faiss::utils::fvec_l2sqr(first.as_raw_slice(), second.as_raw_slice()) as VectorDistance
+    todo!()
+    //faiss::utils::fvec_l2sqr(first.as_raw_slice(), second.as_raw_slice()) as VectorDistance
 }
 
 impl<'a> MeasureDistance for L2SqrDistanceMeasure<'a> {
@@ -247,7 +249,8 @@ fn inner_product_simd(first: VectorRef<'_>, second: VectorRef<'_>) -> VectorDist
 }
 
 pub fn inner_product_faiss(first: VectorRef<'_>, second: VectorRef<'_>) -> VectorDistance {
-    faiss::utils::fvec_inner_product(first.as_raw_slice(), second.as_raw_slice()) as VectorDistance
+    todo!()
+    //faiss::utils::fvec_inner_product(first.as_raw_slice(), second.as_raw_slice()) as VectorDistance
 }
 
 impl<'a> MeasureDistance for InnerProductDistanceMeasure<'a> {

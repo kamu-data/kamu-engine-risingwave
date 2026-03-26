@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use internal_error::*;
-use opendatafabric::engine::grpc_generated::engine_server::EngineServer;
+use odf::metadata::engine::grpc_generated::engine_server::EngineServer;
 use thiserror_ext::AsReport;
 use tonic::transport::Server;
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 use internal_error::*;
 use kamu_engine_risingwave::app::OdfEngineConfig;
 use kamu_engine_risingwave::rw::RisingWaveConfig;
-use opendatafabric::engine::EngineGrpcClient;
+use odf::metadata::engine::EngineGrpcClient;
 
 /////////////////////////////////////////////////////////////////////////////////////////
 

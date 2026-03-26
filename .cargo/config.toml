@@ -34,6 +34,7 @@ rustflags = [
 rustflags = ["--cfg", "tokio_unstable", "-Zhigher-ranked-assumptions"]
 
 [build]
+target-dir = "target"
 rustdocflags = ["-Zhigher-ranked-assumptions"]
 
 # We have large git dependencies. This can make cloning faster.

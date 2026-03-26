@@ -1,6 +1,6 @@
 [package]
 name = "kamu-engine-risingwave"
-version = "0.2.0"
+version = "0.3.0"
 edition = { workspace = true }
 homepage = { workspace = true }
 keywords = { workspace = true }
@@ -13,10 +13,15 @@ doctest = false
 
 
 [features]
-# embedded = ["risingwave_cmd_all", "risingwave_rt"]
-# rw-static-link = ["workspace-config/rw-static-link"]
-# rw-dynamic-link = ["workspace-config/rw-dynamic-link"]
-# default = ["rw-static-link"]
+embedded = [
+    # "risingwave_cmd_all", 
+    "risingwave_rt",
+]
+rw-static-link = ["workspace-config/rw-static-link"]
+rw-dynamic-link = ["workspace-config/rw-dynamic-link"]
+openssl-vendored = ["workspace-config/openssl-vendored"]
+default = ["rw-static-link"]
+fips = ["workspace-config/fips"]
 
 
 [package.metadata.cargo-machete]
@@ -27,15 +32,15 @@ ignored = ["workspace-hack", "workspace-config", "task_stats_alloc"]
 
 
 [dependencies]
-internal-error = { git = "https://github.com/kamu-data/kamu-cli", tag = "v0.261.0", version = "0.261.0", default-features = false }
-opendatafabric = { git = "https://github.com/kamu-data/kamu-cli", tag = "v0.261.0", version = "0.261.0", default-features = false }
+internal-error = { git = "https://github.com/kamu-data/kamu-cli", branch = "master", version = "0.261.0", default-features = false }
+odf = { workspace = true, default-features = false, features = ["engine-rpc"] }
 anyhow = "1"
 indoc = "2"
 chrono = "0.4"
 datafusion = { workspace = true, default-features = false, features = [
     "parquet",
 ] }
-nix = "0"
+nix = { version = "0", features = ["signal"] }
 risingwave_common = { workspace = true }
 # risingwave_cmd_all = { workspace = true, optional = true }
 risingwave_rt = { workspace = true, optional = true }
@@ -49,7 +54,7 @@ tikv-jemallocator = { workspace = true, features = [
     "unprefixed_malloc_on_supported_platforms",
 ] }
 thiserror-ext = { workspace = true }
-tokio = { version = "1", default-features = false, features = [] }
+tokio = { version = "1", default-features = false, features = ["process"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tokio-stream = "0.1"
 tonic = "0.14"

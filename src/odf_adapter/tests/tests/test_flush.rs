@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use indoc::indoc;
-use opendatafabric::*;
+use odf::metadata::*;
 
 use super::{data, df_utils, engine};
 
@@ -95,7 +95,7 @@ async fn test_flush() {
             indoc!(
                 r#"
                 message arrow_schema {
-                  OPTIONAL INT64 offset;
+                  REQUIRED INT64 offset;
                   REQUIRED INT32 op;
                   REQUIRED INT64 system_time (TIMESTAMP(MILLIS,true));
                   OPTIONAL INT64 event_time (TIMESTAMP(MILLIS,true));

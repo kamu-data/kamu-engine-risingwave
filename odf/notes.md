@@ -64,3 +64,42 @@ WITH (
 create table ss_t (symbol varchar primary key, price_avg float, price_max float, count bigint);
 create sink ss into ss_t as select * from v;
 ```
+
+# Basic Top N
+
+```sql
+create table player_scores (
+    event_time TIMESTAMP,
+    match_id INT,
+    player_name STRING,
+    score BIGINT
+);
+
+create materialized view leaderboard as
+select
+    *
+from (
+    select
+        event_time,
+        row_number() over (partition by 1 order by score desc) as place,
+        player_name,
+        score
+    from player_scores
+)
+where place <= 2;
+
+
+INSERT INTO player_scores (event_time, match_id, player_name, score)
+VALUES
+('2000-01-01',1,'Alice',100),
+('2000-01-01',1,'Bob',80);
+
+
+CREATE SINK sink_bh FROM player_scores WITH (connector = 'blackhole');
+
+
+INSERT INTO player_scores (event_time, match_id, player_name, score)
+VALUES
+('2000-01-02',2,'Alice',70),
+('2000-01-02',2,'Charlie',90);
+```
