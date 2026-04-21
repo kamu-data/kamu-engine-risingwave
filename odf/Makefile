@@ -43,41 +43,32 @@ run:
 
 .PHONY: build-release
 build-release:
-	# cd .. && \
-	# 	RUSTFLAGS="--cfg tokio_unstable -Zhigher-ranked-assumptions" \
-	# 	cross build \
-	# 	-p rdkafka-sys \
-	# 	--profile $(PROFILE) \
-	# 	--target $(TARGET_ARCH)
-
 	# Build engine
 	# Keep flags in sync with .cargo/config.toml
 	cd .. && \
-		SASL2_STATIC=0 \
 		RUSTFLAGS="--cfg tokio_unstable -Zhigher-ranked-assumptions" \
-		cross build \
+		cargo build \
 		-p risingwave_cmd_all \
 		--features rw-static-link \
-		--profile $(PROFILE) \
-		--target $(TARGET_ARCH)
+		--profile $(PROFILE)
 
-	# Build adapter
+	# # Build adapter
 	cd .. && \
-		SASL2_STATIC=0 \
 		RUSTFLAGS="--cfg tokio_unstable -Zhigher-ranked-assumptions" \
-		cross build \
+		cargo build \
 		-p kamu-engine-risingwave \
-		--profile $(PROFILE) \
-		--target $(TARGET_ARCH)
+		--profile $(PROFILE)
+
+
+.PHONY: build-release-nix
+build-release-nix: build-release
+	patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 ../target/$(PROFILE)/kamu-engine-risingwave
+	patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 ../target/$(PROFILE)/risingwave
 
 
 # Build image for local testing purposes
 .PHONY: image
 image:
-	rm -rf .tmp && mkdir -p .tmp/$(PLATFORM)
-	cp ../target/$(TARGET_ARCH)/$(PROFILE)/kamu-engine-risingwave .tmp/$(PLATFORM)/kamu-engine-risingwave
-	cp ../target/$(TARGET_ARCH)/$(PROFILE)/risingwave .tmp/$(PLATFORM)/risingwave
-
 	cd .. && docker build \
 	    --build-arg target_arch=$(TARGET_ARCH) \
 		-t $(IMAGE) \

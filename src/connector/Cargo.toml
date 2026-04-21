@@ -136,12 +136,7 @@ pulsar = { version = "6.7", default-features = false, features = [
     "lz4",
     "zstd",
 ] }
-rdkafka = { workspace = true, features = [
-    "cmake-build",
-    "ssl",
-    "gssapi",
-    "zstd",
-] }
+rdkafka = { workspace = true, features = ["cmake-build"] }
 redis = { workspace = true, features = [
     "aio",
     "tokio-comp",

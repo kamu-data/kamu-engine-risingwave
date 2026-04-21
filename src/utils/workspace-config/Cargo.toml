@@ -25,7 +25,7 @@ ignored = [
 # some crates opt-in static linking, while some opt-in dynamic linking,
 # so they are two features :)
 openssl-vendored = ["vendored-openssl-sys"]
-rw-static-link = ["static-libz-sys", "static-lzma-sys", "static-sasl2-sys"]
+rw-static-link = ["static-libz-sys", "static-lzma-sys"]
 rw-dynamic-link = ["dynamic-zstd-sys"]
 fips = ["aws-lc-rs"]
 
